@@ -6,3 +6,6 @@
 **/obj/
 
 .DS_Store
+
+# Полные артефакты прогонов (results/raw/<stamp>-*) — не для коммита
+results/raw/

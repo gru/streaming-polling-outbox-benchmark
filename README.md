@@ -10,7 +10,7 @@
 ## Что получилось в итоге
 
 - **Запись — через outbox-таблицу** (`public.outbox_messages`): Writer делает INSERT + DELETE в одной транзакции, таблица всегда пустая, сообщение живёт в WAL. От `pg_logical_emit_message()` отказались: плагин `pgoutput` не передаёт logical messages ни в одной версии PostgreSQL (проверено на 17.2 и 18.4), а `test_decoding`, который их видит, не подходит для production.
-- **Чтение Polling** — `peek` + `advance` через SECURITY DEFINER-функции (`cdc.peek_outbox_changes` / `cdc.advance_outbox_slot`), вызываются от пользователя `sys_app` **без** атрибута REPLICATION (прямой peek требует привилегии REPLICATION, которую прикладному пользователю не даём).
+- **Чтение Polling** — `pg_logical_slot_peek_binary_changes()` + `pg_replication_slot_advance()` через SECURITY DEFINER-обёртки `cdc.peek_outbox_changes()` / `cdc.advance_outbox_slot()`, вызываются от пользователя `sys_app` **без** атрибута REPLICATION (прямой вызов этих функций требует привилегии REPLICATION, которую прикладному пользователю не даём).
 - **Чтение Streaming** — чтение напрямую из слота репликации через Npgsql (`PgOutputReplicationSlot`, pgoutput) от пользователя `sys_replication` с атрибутом REPLICATION.
 
 ## Результаты прогонов
@@ -31,7 +31,7 @@
 
 Один сценарий — две строки (армы рядом, сравнение построчно). Колонки:
 
-- **Арм** — реализация CDC: polling (peek/advance) или streaming (репликация).
+- **Арм** — реализация CDC: polling (`pg_logical_slot_peek_binary_changes` + `pg_replication_slot_advance`) или streaming (репликация).
 - **Скорость (overall)** — средняя скорость доставки по всему окну сценария: доставлено сообщений / (t2 − t0).
 - **Пик** — максимум скорости доставки между соседними сэмплами счётчика доставки CDC (сэмплер опрашивает раз в ~1.5–2 с, т.е. пик усреднён по этому интервалу).
 - **e2e mean / e2e p95** — сквозная латентность одного сообщения: от `created_at` (проставляет Writer в момент создания) до Kafka delivery report (подтверждение записи брокером, acks=all). mean — среднее за сценарий, p95 — 95-й перцентиль.
