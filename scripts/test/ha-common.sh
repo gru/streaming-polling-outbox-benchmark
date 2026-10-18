@@ -291,7 +291,7 @@ wait_cdc_state() { # state timeout_s
 # Диагностический дамп /api/cdc/state (обрезанный) — почему ожидание не сошлось.
 cdc_state_raw() { curl -s --max-time 15 "http://localhost:$CDC_PORT/api/cdc/state" | head -c 300; }
 # Известный дефект стенда (deviations 9н): стек KafkaFlow 4.2.0 нативно SIGSEGV
-# (exit 139) при ПОЛНОЙ потере Kafka-брокеров после любой продукции — обе армы,
+# (exit 139) при ПОЛНОЙ потере Kafka-брокеров после любой продукции — обе реализации,
 # вне управляемого кода. Рестарт-политика возвращает контейнер; at-least-once
 # сохраняется (слот держит позицию). Тесты это учитывают: рестарты = наблюдение.
 cdc_restarts() { docker inspect "streaming-polling-outbox-cdc-$ARM-1" --format '{{.RestartCount}}' 2>/dev/null || echo "?"; }
