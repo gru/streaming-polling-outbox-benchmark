@@ -1,0 +1,46 @@
+# Prometheus: pull model, scrape interval ~5s.
+# Grafana/Pushgateway не настраиваются.
+# Exporters инфраструктуры (postgres-exporter, kafka-exporter, cadvisor) в этом стенде
+# не поднимаются: их метрики потреблял только check-infra/HA-контекст исходного проекта
+# (deviations §7 исходного репозитория); benchmark-методика их не использует.
+# Patroni /metrics не скрапим: требует basic-auth в этом файле, а конфиг
+# bind-mounted из репозитория и не темплейтится env'ом (hardcoded secrets запрещены).
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+  external_labels:
+    stand: streaming-polling-outbox
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: etcd
+    static_configs:
+      - targets:
+          - etcd1:2379
+          - etcd2:2379
+          - etcd3:2379
+
+  - job_name: writer
+    static_configs:
+      - targets: ['writer:8080']
+
+  # CDC Polling (target поднимается вместе с сервисом --profile polling)
+  - job_name: cdc-polling
+    static_configs:
+      - targets: ['cdc-polling:8080']
+
+  # CDC Streaming (target поднимается вместе с сервисом --profile streaming;
+  # профили polling/streaming никогда не работают на одном слоте одновременно)
+  - job_name: cdc-streaming
+    static_configs:
+      - targets: ['cdc-streaming:8080']
+
+  # Валидатор доставки: потребление topic, валидации прогонов, состояние.
+  # Детализация по прогонам — через HTTP API валидатора, не через метрики.
+  - job_name: kafka-validator
+    static_configs:
+      - targets: ['kafka-validator:8080']
