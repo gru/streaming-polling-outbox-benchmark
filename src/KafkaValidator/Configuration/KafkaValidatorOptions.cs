@@ -30,7 +30,7 @@ public sealed class KafkaValidatorOptions
 
 public sealed class KafkaOptions
 {
-    public string Brokers { get; set; } = "kafka1:9092,kafka2:9092,kafka3:9092";
+    public string Brokers { get; set; } = "kafka1:9092";
 
     public string Topic { get; set; } = "outbox.events";
 

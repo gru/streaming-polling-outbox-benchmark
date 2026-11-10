@@ -338,13 +338,13 @@ prom_query() { curl -sG --max-time 5 http://localhost:9090/api/v1/query --data-u
 
 # ---------- Kafka ----------
 
-kafka_stop_all()  { $DC stop kafka1 kafka2 kafka3 >/dev/null 2>&1; }
-kafka_start_all() { $DC start kafka1 kafka2 kafka3 >/dev/null 2>&1; }
+kafka_stop_all()  { $DC stop kafka1 >/dev/null 2>&1; }
+kafka_start_all() { $DC start kafka1 >/dev/null 2>&1; }
 wait_kafka_healthy() { # timeout_s
   local timeout=$1 svc
   for _ in $(seq 1 $(( timeout / 2 ))); do
     local all=1
-    for svc in kafka1 kafka2 kafka3; do
+    for svc in kafka1; do
       [[ "$($DC ps "$svc" --format '{{.Health}}' 2>/dev/null)" == "healthy" ]] || all=0
     done
     [[ "$all" == "1" ]] && return 0

@@ -19,7 +19,7 @@ builder.Services.AddSingleton<KafkaPublisher>();
 
 // KafkaFlow — основной API публикации (requirements.md 9); topic НЕ создаётся
 // автоматически (requirements.md 3.2: topic создаёт kafka-init).
-var kafkaBrokers = (builder.Configuration["CdcPolling:Kafka:Brokers"] ?? "kafka1:9092,kafka2:9092,kafka3:9092")
+var kafkaBrokers = (builder.Configuration["CdcPolling:Kafka:Brokers"] ?? "kafka1:9092")
     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 var kafkaTopic = builder.Configuration["CdcPolling:Kafka:Topic"] ?? "outbox.events";
 var kafkaLingerMs = double.TryParse(builder.Configuration["CdcPolling:Kafka:LingerMs"], out var linger) ? linger : 5.0;

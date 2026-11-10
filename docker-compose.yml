@@ -20,8 +20,6 @@ volumes:
   pg2_data: {}
   pg3_data: {}
   kafka1_data: {}
-  kafka2_data: {}
-  kafka3_data: {}
   prometheus_data: {}
   pgbouncer_config: {}
 
@@ -290,9 +288,14 @@ services:
 
   # ---------- Kafka KRaft ----------
 
+  # ОДИН узел (broker+controller): Kafka — транспорт, а не объект измерения.
+  # Три брокера на одной машине боролись за CPU/диск replication-трафиком и
+  # начинали душить producer (acks=all, min.isr) раньше, чем упиралось чтение
+  # outbox — результаты мерили Kafka вместо CDC. RF=1, min.isr=1: acks=all
+  # подтверждается лидером без ожидания реплик.
   kafka1:
     image: apache/kafka:3.9.0
-    environment: &kafka-env
+    environment:
       CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -300,15 +303,15 @@ services:
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka1:9092
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka1:9093,2@kafka2:9093,3@kafka3:9093
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka1:9093
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_LOG_DIRS: /var/lib/kafka/data
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
-      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
-      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_HEAP_OPTS: -Xmx512m -Xms256m
     networks: [outbox-net]
@@ -316,46 +319,6 @@ services:
       - kafka1_data:/var/lib/kafka/data
     ports:
       - "9092:9092"
-    healthcheck:
-      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/9092'"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-    restart: unless-stopped
-    stop_grace_period: 30s
-
-  kafka2:
-    image: apache/kafka:3.9.0
-    environment:
-      <<: *kafka-env
-      KAFKA_NODE_ID: 2
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka2:9092
-    networks: [outbox-net]
-    volumes:
-      - kafka2_data:/var/lib/kafka/data
-    ports:
-      - "9093:9092"
-    healthcheck:
-      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/9092'"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-    restart: unless-stopped
-    stop_grace_period: 30s
-
-  kafka3:
-    image: apache/kafka:3.9.0
-    environment:
-      <<: *kafka-env
-      KAFKA_NODE_ID: 3
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka3:9092
-    networks: [outbox-net]
-    volumes:
-      - kafka3_data:/var/lib/kafka/data
-    ports:
-      - "9094:9092"
     healthcheck:
       test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/9092'"]
       interval: 10s
@@ -379,14 +342,12 @@ services:
           --create --if-not-exists \
           --topic outbox.events \
           --partitions 6 \
-          --replication-factor 3 \
-          --config min.insync.replicas=2
+          --replication-factor 1 \
+          --config min.insync.replicas=1
         echo "[kafka-init] Done."
     restart: "no"
     depends_on:
       kafka1: {condition: service_healthy}
-      kafka2: {condition: service_healthy}
-      kafka3: {condition: service_healthy}
 
   # ---------- Writer (этап 3) ----------
 
@@ -452,7 +413,7 @@ services:
       CDCPOLLING__CONNECTION__DATABASE__PASSWORD: ${SYS_APP_PASSWORD:?set in .env}
       CDCPOLLING__POLL__BATCHSIZE: ${CDC_POLLING_POLL_BATCH_SIZE:-100}
       CDCPOLLING__POLL__IDLEINTERVALMS: "500"
-      CDCPOLLING__KAFKA__BROKERS: kafka1:9092,kafka2:9092,kafka3:9092
+      CDCPOLLING__KAFKA__BROKERS: kafka1:9092
       CDCPOLLING__KAFKA__TOPIC: outbox.events
       CDCPOLLING__KAFKA__BATCHSIZE: ${CDC_POLLING_KAFKA_BATCH_SIZE:-100}
       CDCPOLLING__KAFKA__LINGERMS: "5"
@@ -472,8 +433,6 @@ services:
       haproxy: {condition: service_healthy}
       pgbouncer: {condition: service_healthy}
       kafka1: {condition: service_healthy}
-      kafka2: {condition: service_healthy}
-      kafka3: {condition: service_healthy}
       # topic создаётся до старта CDC (сам CDC topic не создаёт, requirements.md 3.2)
       kafka-init: {condition: service_completed_successfully}
 
@@ -504,7 +463,7 @@ services:
       CDCSTREAMING__STREAMING__SLOTNAME: outbox_slot
       CDCSTREAMING__STREAMING__PUBLICATION: outbox_publication
       CDCSTREAMING__STREAMING__CHANNELCAPACITY: "2048"
-      CDCSTREAMING__KAFKA__BROKERS: kafka1:9092,kafka2:9092,kafka3:9092
+      CDCSTREAMING__KAFKA__BROKERS: kafka1:9092
       CDCSTREAMING__KAFKA__TOPIC: outbox.events
       CDCSTREAMING__KAFKA__BATCHSIZE: ${CDC_STREAMING_KAFKA_BATCH_SIZE:-100}
       CDCSTREAMING__KAFKA__LINGERMS: "5"
@@ -524,8 +483,6 @@ services:
       # PgBouncer сознательно НЕ в зависимостях: replication идёт мимо него
       haproxy: {condition: service_healthy}
       kafka1: {condition: service_healthy}
-      kafka2: {condition: service_healthy}
-      kafka3: {condition: service_healthy}
       # topic создаётся до старта CDC (сам CDC topic не создаёт, requirements.md 3.2)
       kafka-init: {condition: service_completed_successfully}
 
@@ -544,7 +501,7 @@ services:
     image: streaming-polling-outbox/kafka-validator:net8.0
     environment:
       ASPNETCORE_URLS: http://+:8080
-      KAFKAVALIDATOR__KAFKA__BROKERS: kafka1:9092,kafka2:9092,kafka3:9092
+      KAFKAVALIDATOR__KAFKA__BROKERS: kafka1:9092
       KAFKAVALIDATOR__KAFKA__TOPIC: outbox.events
       KAFKAVALIDATOR__KAFKA__GROUPID: kafka-validator
       KAFKAVALIDATOR__WRITER__BASEURL: http://writer:8080
@@ -563,8 +520,6 @@ services:
     stop_grace_period: 30s
     depends_on:
       kafka1: {condition: service_healthy}
-      kafka2: {condition: service_healthy}
-      kafka3: {condition: service_healthy}
       kafka-init: {condition: service_completed_successfully}
       # ожидаемый набор id берётся у Writer по запросу (fetchFromWriter)
       writer: {condition: service_healthy}

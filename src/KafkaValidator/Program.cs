@@ -36,7 +36,7 @@ builder.Services.AddHttpClient<CdcClient>();
 // о потерях. Побочный эффект: kafka_consumergroup_lag для этой группы не
 // возникает (нет закоммиченных оффсетов) — §13.3 «если применимо»,
 // см. docs/deviations.md 8.
-var kafkaBrokers = (builder.Configuration["KafkaValidator:Kafka:Brokers"] ?? "kafka1:9092,kafka2:9092,kafka3:9092")
+var kafkaBrokers = (builder.Configuration["KafkaValidator:Kafka:Brokers"] ?? "kafka1:9092")
     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 var kafkaTopic = builder.Configuration["KafkaValidator:Kafka:Topic"] ?? "outbox.events";
 var kafkaGroupId = builder.Configuration["KafkaValidator:Kafka:GroupId"] ?? "kafka-validator";

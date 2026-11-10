@@ -10,7 +10,7 @@
 | **pg1–pg3** (Patroni + PostgreSQL 17) | HA-кластер с синхронной репликацией. БД `outbox`: таблица `public.outbox_messages` в publication `outbox_publication`, failover-слот `outbox_slot` |
 | **HAProxy** `:5432` | Единая точка входа к текущему primary |
 | **PgBouncer** `:6432` | Пул соединений Writer'а (transaction pooling); replication-трафик идёт мимо него, напрямую через HAProxy |
-| **kafka1–3** (KRaft) | Брокеры; топик `outbox.events` |
+| **kafka1** (KRaft, 1 узел) | Топик `outbox.events`. Один broker+controller без реплик: Kafka — транспорт, а не объект измерения (кластер из 3 брокеров на одной машине душил запись раньше, чем упиралось чтение outbox) |
 | **writer** `:18080` | Генератор нагрузки: INSERT+DELETE в outbox-таблицу одной транзакцией — таблица всегда пустая, сообщение живёт в WAL |
 | **cdc-polling** (profile `polling`) `:18081` | Реализация A: чтение слота SQL-функциями `pg_logical_slot_peek_binary_changes` + `pg_replication_slot_advance` |
 | **cdc-streaming** (profile `streaming`) `:18082` | Реализация B: чтение слота протоколом логической репликации (Npgsql) |

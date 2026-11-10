@@ -351,7 +351,7 @@ proj = "streaming-polling-outbox"
 scen["resources"] = {
     "cdc": role_stats([f"{proj}-cdc-"]),
     "postgresql": role_stats([f"{proj}-pg1", f"{proj}-pg2", f"{proj}-pg3"]),
-    "kafka": role_stats([f"{proj}-kafka1", f"{proj}-kafka2", f"{proj}-kafka3"]),
+    "kafka": role_stats([f"{proj}-kafka1"]),
 }
 
 json.dump(scen, open(os.environ["SCEN_OUT"], "w"), ensure_ascii=False, indent=2, sort_keys=True)
@@ -383,7 +383,7 @@ wait_stand_ready() {
   local synced
   synced=$(wait_slot_synced 600)
   [[ -n "$synced" ]] && ok "слот synced на standby ($synced)" || bad "слот не synced за 600с"
-  wait_kafka_healthy 300 && ok "Kafka: 3 брокера healthy" || { bad "Kafka не healthy"; return 1; }
+  wait_kafka_healthy 300 && ok "Kafka: брокер healthy" || { bad "Kafka не healthy"; return 1; }
   for i in $(seq 1 3); do wait_validator_ready && break; sleep 5; done
   [[ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 "$VBASE/ready")" == "200" ]] \
     && ok "KafkaValidator /ready=200" || { bad "валидатор не готов"; return 1; }
@@ -468,7 +468,7 @@ if t0s and t2s:
         "window": {"fromMs": min(t0s), "toMs": max(t2s)},
         "cdc": cycle_role_resources([f"{proj}-cdc-"], min(t0s), max(t2s)),
         "postgresql": cycle_role_resources([f"{proj}-pg1", f"{proj}-pg2", f"{proj}-pg3"], min(t0s), max(t2s)),
-        "kafka": cycle_role_resources([f"{proj}-kafka1", f"{proj}-kafka2", f"{proj}-kafka3"], min(t0s), max(t2s)),
+        "kafka": cycle_role_resources([f"{proj}-kafka1"], min(t0s), max(t2s)),
         "writer": cycle_role_resources([f"{proj}-writer-"], min(t0s), max(t2s)),
     }
 
