@@ -1,0 +1,120 @@
+{
+  "scenarios": [
+    {
+      "polling": {
+        "cdcRateAvg": 50.0,
+        "cdcRateOverall": 49.9,
+        "cdcRatePeak": 95.4,
+        "deliveryTotalMs": 601169,
+        "drainMs": 102,
+        "duplicates": 0,
+        "e2eMeanMs": 267.5,
+        "e2eP95Ms": 495.8976
+      },
+      "scenario": "s1-steady-50",
+      "streaming": {
+        "cdcRateAvg": 49.9,
+        "cdcRateOverall": 50.0,
+        "cdcRatePeak": 140.7,
+        "deliveryTotalMs": 600380,
+        "drainMs": 98,
+        "duplicates": 0,
+        "e2eMeanMs": 35.0,
+        "e2eP95Ms": 16.9557
+      }
+    },
+    {
+      "polling": {
+        "cdcRateAvg": 199.8,
+        "cdcRateOverall": 199.7,
+        "cdcRatePeak": 332.7,
+        "deliveryTotalMs": 300387,
+        "drainMs": 116,
+        "duplicates": 0,
+        "e2eMeanMs": 274.7,
+        "e2eP95Ms": 513.6691
+      },
+      "scenario": "s2-steady-200",
+      "streaming": {
+        "cdcRateAvg": 199.9,
+        "cdcRateOverall": 199.8,
+        "cdcRatePeak": 282.8,
+        "deliveryTotalMs": 300292,
+        "drainMs": 96,
+        "duplicates": 0,
+        "e2eMeanMs": 11.2,
+        "e2eP95Ms": 13.4695
+      }
+    },
+    {
+      "polling": {
+        "cdcRateAvg": null,
+        "cdcRateOverall": 9000.9,
+        "cdcRatePeak": 19102.2,
+        "deliveryTotalMs": 2222,
+        "drainMs": 95,
+        "duplicates": 0,
+        "e2eMeanMs": null,
+        "e2eP95Ms": 611.6482
+      },
+      "scenario": "s3-burst",
+      "streaming": {
+        "cdcRateAvg": null,
+        "cdcRateOverall": 9074.4,
+        "cdcRatePeak": 18814.7,
+        "deliveryTotalMs": 2204,
+        "drainMs": 92,
+        "duplicates": 0,
+        "e2eMeanMs": null,
+        "e2eP95Ms": 63.252
+      }
+    },
+    {
+      "polling": {
+        "cdcRateAvg": 50.0,
+        "cdcRateOverall": 49.9,
+        "cdcRatePeak": 95.8,
+        "deliveryTotalMs": 300409,
+        "drainMs": 116,
+        "duplicates": 0,
+        "e2eMeanMs": 279.3,
+        "e2eP95Ms": 520.4353
+      },
+      "scenario": "s4-large-4k",
+      "streaming": {
+        "cdcRateAvg": 49.9,
+        "cdcRateOverall": 50.0,
+        "cdcRatePeak": 141.4,
+        "deliveryTotalMs": 300292,
+        "drainMs": 97,
+        "duplicates": 0,
+        "e2eMeanMs": 36.9,
+        "e2eP95Ms": 28.8923
+      }
+    },
+    {
+      "polling": {
+        "cdcRateAvg": 30962.8,
+        "cdcRateOverall": 29422.6,
+        "cdcRatePeak": 47098.0,
+        "deliveryTotalMs": 13595,
+        "drainMs": 7405,
+        "duplicates": 0,
+        "e2eMeanMs": 4184.6,
+        "e2eP95Ms": 9061.5085
+      },
+      "scenario": "s5-throughput",
+      "streaming": {
+        "cdcRateAvg": 95548.3,
+        "cdcRateOverall": 94206.3,
+        "cdcRatePeak": 101174.2,
+        "deliveryTotalMs": 4246,
+        "drainMs": 106,
+        "duplicates": 0,
+        "e2eMeanMs": 36.3,
+        "e2eP95Ms": 24.7705
+      }
+    }
+  ],
+  "schema": "streaming-polling-outbox/benchmark-summary/v1"
+}
