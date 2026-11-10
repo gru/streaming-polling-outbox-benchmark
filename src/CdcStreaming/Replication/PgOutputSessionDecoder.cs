@@ -22,19 +22,17 @@ public sealed record DecodedMessage(char Kind, FlushItem? Completed);
 /// получает сырые байты peek-выборки и сам читает форматы, здесь Npgsql уже
 /// декодировал протокол в типизированные сообщения — мы только группируем
 /// транзакции (xid приходит с Begin; в proto v1 промежуточные сообщения xid
-/// не несут) и собираем события из значений NewRow.
+/// не несут) и собираем события из значений NewRow. Маппинг колонок и валидация
+/// строки — общее ядро CdcCommon.OutboxRowParser (план строится на Relation).
 ///
 /// Сообщения Npgsql переиспользуются: значения Insert нужно прочитать до
 /// следующего MoveNextAsync — декодер делает это сразу в ProcessAsync.
 /// </summary>
 public sealed class PgOutputSessionDecoder
 {
-    public const string OutboxSchema = "public";
-    public const string OutboxTable = "outbox_messages";
-
     private readonly Dictionary<uint, List<PendingEvent>> _pendingByXid = new();
     private uint _currentXid;
-    private OutboxColumnMap? _columnMap;
+    private OutboxColumnPlan? _columnPlan;
 
     /// <summary>События транзакций, чей Commit ещё не пришёл (диагностика; при переподключении отбрасываются).</summary>
     public int IncompleteEventCount
@@ -97,7 +95,7 @@ public sealed class PgOutputSessionDecoder
         var names = new string[relation.Columns.Count];
         for (var i = 0; i < relation.Columns.Count; i++)
             names[i] = relation.Columns[i].ColumnName;
-        _columnMap = OutboxColumnMap.Create(names);
+        _columnPlan = OutboxRowParser.BuildColumnPlan(names);
     }
 
     private async Task OnInsertAsync(InsertMessage insert, CancellationToken ct)
@@ -105,47 +103,47 @@ public sealed class PgOutputSessionDecoder
         if (!IsOutboxRelation(insert.Relation))
             return; // событие не порождается; NewRow не читаем — Npgsql потребит его сам
 
-        var map = _columnMap ?? throw new PgOutputParseException(
-            $"Insert для public.outbox_messages без предшествующего Relation в сессии (xid={_currentXid})");
+        var plan = _columnPlan ?? throw new PgOutputParseException(
+            $"Insert для {OutboxRowParser.OutboxSchema}.{OutboxRowParser.OutboxTable} без предшествующего Relation в сессии (xid={_currentXid})");
 
         // Все значения читаем как string: pgoutput proto v1 передаёт колонки текстом,
         // и Npgsql размечает их DataTypeName='text' — Get<Guid>/Get<DateTime> кидают
-        // InvalidCastException. Разбор строк — тот же, что у Polling (Guid.TryParse,
-        // PgOutputParser.ParseTimestamp)
+        // InvalidCastException. Маппинг позиций — слотами плана (построен на Relation);
+        // Null/UnchangedToastedValue оставляют значение null — OutboxRowParser.Parse
+        // репортит пустые колонки (для outbox-строки это фатально)
         string? idText = null;
         string? topic = null;
         string? body = null;
         string? createdAtText = null;
-        var missing = new List<OutboxColumn>();
 
         var position = 0;
         await foreach (var value in insert.NewRow.WithCancellation(ct).ConfigureAwait(false))
         {
-            if (map.TryGetColumn(position, out var column))
+            if (position < plan.Slots.Length)
             {
-                // Null/UnchangedToastedValue → значение отсутствует (для outbox-строки фатально)
-                if (value.Kind is TupleDataKind.Null or TupleDataKind.UnchangedToastedValue)
-                    missing.Add(column);
-                else
+                var slot = plan.Slots[position];
+                if (slot != OutboxColumnSlot.Ignored)
                 {
-                    var text = await value.Get<string>(ct).ConfigureAwait(false);
-                    switch (column)
+                    if (value.Kind == TupleDataKind.TextValue)
                     {
-                        case OutboxColumn.Id: idText = text; break;
-                        case OutboxColumn.Topic: topic = text; break;
-                        case OutboxColumn.Body: body = text; break;
-                        case OutboxColumn.CreatedAt: createdAtText = text; break;
+                        var text = await value.Get<string>(ct).ConfigureAwait(false);
+                        switch (slot)
+                        {
+                            case OutboxColumnSlot.Id: idText = text; break;
+                            case OutboxColumnSlot.Topic: topic = text; break;
+                            case OutboxColumnSlot.Body: body = text; break;
+                            case OutboxColumnSlot.CreatedAt: createdAtText = text; break;
+                        }
                     }
+                    else if (value.Kind is not (TupleDataKind.Null or TupleDataKind.UnchangedToastedValue))
+                        throw new PgOutputParseException(
+                            $"неожидаемый вид значения колонки '{value.Kind}' на позиции {position} (xid={_currentXid})");
                 }
             }
             position++;
         }
 
-        if (missing.Count > 0)
-            throw new PgOutputParseException(
-                $"Insert outbox-строки с NULL/unchanged-TOAST колонками: [{string.Join(", ", missing)}] (xid={_currentXid}); все колонки NOT NULL");
-
-        var created = OutboxRowFactory.Create(idText, topic, body, createdAtText, _currentXid, Lsn.Zero);
+        var created = OutboxRowParser.Parse(idText, topic, body, createdAtText, _currentXid);
         if (!_pendingByXid.TryGetValue(_currentXid, out var list))
             _pendingByXid[_currentXid] = list = new List<PendingEvent>();
         list.Add(new PendingEvent(created.Id, created.Topic, created.BodyJson, created.CreatedAtUtc));
@@ -169,8 +167,8 @@ public sealed class PgOutputSessionDecoder
     }
 
     private static bool IsOutboxRelation(RelationMessage relation) =>
-        string.Equals(relation.Namespace, OutboxSchema, StringComparison.Ordinal) &&
-        string.Equals(relation.RelationName, OutboxTable, StringComparison.Ordinal);
+        string.Equals(relation.Namespace, OutboxRowParser.OutboxSchema, StringComparison.Ordinal) &&
+        string.Equals(relation.RelationName, OutboxRowParser.OutboxTable, StringComparison.Ordinal);
 
     private sealed record PendingEvent(Guid Id, string Topic, string BodyJson, DateTimeOffset CreatedAtUtc);
 }

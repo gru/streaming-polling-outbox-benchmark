@@ -1,4 +1,3 @@
-using System.Globalization;
 using System.Text;
 
 namespace CdcCommon.PgOutput;
@@ -14,6 +13,10 @@ namespace CdcCommon.PgOutput;
 /// B/R/C — служебные (R кэшируется в пределах батча: каждая peek-сессия
 /// декодирования объявляет relations заново).
 ///
+/// Маппинг колонок и валидация значений строки — общее ядро OutboxRowParser
+/// (на Relation строится OutboxColumnPlan, переиспользуемый для всех Insert
+/// батча); здесь — только чтение wire-формата и группировка по транзакциям.
+///
 /// События публикуются только для транзакций, чей Commit присутствует в батче:
 /// peek возвращает выборку, выровненную по границам транзакций (upto_nchanges
 /// проверяется после декодирования очередной транзакции), но парсер не
@@ -21,20 +24,10 @@ namespace CdcCommon.PgOutput;
 /// </summary>
 public static class PgOutputParser
 {
-    public const string OutboxSchema = "public";
-    public const string OutboxTable = "outbox_messages";
-
-    /// <summary>Единственный разрешённый topic (CHECK в таблице; здесь — вторая линия защиты от произвольной маршрутизации).</summary>
-    public const string AllowedTopic = "outbox.events";
-
-    private const string ColumnId = "id";
-    private const string ColumnTopic = "topic";
-    private const string ColumnBody = "body";
-    private const string ColumnCreatedAt = "created_at";
-
     public static PgOutputBatch Parse(IReadOnlyList<RawSlotRecord> records)
     {
         var relations = new Dictionary<int, PgOutputRelation>();
+        var plans = new Dictionary<int, OutboxColumnPlan>();
         var pendingByXid = new Dictionary<uint, List<PendingEvent>>();
         var events = new List<OutboxEvent>();
         var counts = new SortedDictionary<char, long>();
@@ -68,11 +61,13 @@ public static class PgOutputParser
                 {
                     var relation = ParseRelation(ref reader);
                     relations[relation.RelationId] = relation;
+                    if (relation.Is(OutboxRowParser.OutboxSchema, OutboxRowParser.OutboxTable))
+                        plans[relation.RelationId] = OutboxRowParser.BuildColumnPlan(ColumnNames(relation));
                     break;
                 }
 
                 case 'I':
-                    ParseInsert(ref reader, rec, relations, pendingByXid);
+                    ParseInsert(ref reader, rec, relations, plans, pendingByXid);
                     break;
 
                 case 'D': // Delete: relation_id, 'K'/'O' (ключ/старый кортеж), TupleData —
@@ -145,7 +140,8 @@ public static class PgOutputParser
     }
 
     private static void ParseInsert(ref PgOutputReader reader, RawSlotRecord rec,
-        Dictionary<int, PgOutputRelation> relations, Dictionary<uint, List<PendingEvent>> pendingByXid)
+        Dictionary<int, PgOutputRelation> relations, Dictionary<int, OutboxColumnPlan> plans,
+        Dictionary<uint, List<PendingEvent>> pendingByXid)
     {
         var relationId = reader.ReadInt32();
         var tupleKind = reader.ReadByte();
@@ -179,63 +175,42 @@ public static class PgOutputParser
             }
         }
 
-        if (!relation.Is(OutboxSchema, OutboxTable))
+        if (!relation.Is(OutboxRowParser.OutboxSchema, OutboxRowParser.OutboxTable))
             return; // публикация содержит только outbox_messages; чужие записи просто не считаем событиями
 
-        string? ByName(string columnName)
+        if (!plans.TryGetValue(relationId, out var plan))
+            throw new PgOutputParseException(
+                $"Insert для relation_id={relationId} без плана колонок (Relation-запись без обязательных колонок?; xid={rec.Xid})");
+
+        // Слот-диспатч по плану, построенному один раз на Relation (pgoutput
+        // присылает значения позиционно, в порядке колонок Relation-записи)
+        string? idText = null;
+        string? topic = null;
+        string? bodyJson = null;
+        string? createdAtText = null;
+        for (var i = 0; i < ncols && i < plan.Slots.Length; i++)
         {
-            for (var i = 0; i < relation.Columns.Count && i < values.Length; i++)
-                if (string.Equals(relation.Columns[i].Name, columnName, StringComparison.Ordinal))
-                    return values[i];
-            return null;
+            switch (plan.Slots[i])
+            {
+                case OutboxColumnSlot.Id: idText = values[i]; break;
+                case OutboxColumnSlot.Topic: topic = values[i]; break;
+                case OutboxColumnSlot.Body: bodyJson = values[i]; break;
+                case OutboxColumnSlot.CreatedAt: createdAtText = values[i]; break;
+            }
         }
 
-        var idText = Required(ByName(ColumnId), ColumnId, rec);
-        var topic = Required(ByName(ColumnTopic), ColumnTopic, rec);
-        var bodyJson = Required(ByName(ColumnBody), ColumnBody, rec);
-        var createdAtText = Required(ByName(ColumnCreatedAt), ColumnCreatedAt, rec);
-
-        if (!Guid.TryParse(idText, out var id))
-            throw new PgOutputParseException($"колонка id не является UUID: '{idText}' (xid={rec.Xid})");
-        if (!string.Equals(topic, AllowedTopic, StringComparison.Ordinal))
-            throw new PgOutputParseException(
-                $"запрещённый topic '{topic}' в outbox-строке (допустим только '{AllowedTopic}'; xid={rec.Xid})");
-        var createdAt = ParseTimestamp(createdAtText, rec);
-
-        var pending = new PendingEvent(id, topic, bodyJson, createdAt);
+        var created = OutboxRowParser.Parse(idText, topic, bodyJson, createdAtText, rec.Xid);
         if (!pendingByXid.TryGetValue(rec.Xid, out var list))
             pendingByXid[rec.Xid] = list = new List<PendingEvent>();
-        list.Add(pending);
+        list.Add(new PendingEvent(created.Id, created.Topic, created.BodyJson, created.CreatedAtUtc));
     }
 
-    private static string Required(string? value, string column, RawSlotRecord rec)
+    private static string[] ColumnNames(PgOutputRelation relation)
     {
-        if (value is null)
-            throw new PgOutputParseException(
-                $"колонка {column} пуста (NULL или unchanged-TOAST) в Insert outbox-строки (xid={rec.Xid}); все колонки NOT NULL");
-        return value;
-    }
-
-    /// <summary>
-    /// Текстовый формат timestamptz PG (DateStyle=ISO): "2026-10-16 12:34:56.789+00".
-    /// Целочасовое смещение PG пишет как +HH — .NET ожидает +HH:MM, дописываем
-    /// минуты; формат +HH:MM/+HHMM тоже поддержан. Строки без времени (без ':')
-    /// не трогаем — это не timestamptz-вывод PG.
-    /// </summary>
-    public static DateTimeOffset ParseTimestamp(string text, RawSlotRecord? rec = null)
-    {
-        var s = text.Trim();
-        if (s.Contains(':'))
-        {
-            if (s.Length >= 3 && s[^3] is '+' or '-')
-                s += ":00";                        // "+03" → "+03:00"
-            else if (s.Length >= 5 && s[^5] is '+' or '-' && char.IsAsciiDigit(s[^3]))
-                s = s.Insert(s.Length - 2, ":");   // "+0300" → "+03:00"
-        }
-        if (DateTimeOffset.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var dto))
-            return dto.ToUniversalTime();
-        throw new PgOutputParseException(
-            $"не удалось разобрать timestamptz '{text}'{(rec is null ? "" : $" (xid={rec.Xid})")}");
+        var names = new string[relation.Columns.Count];
+        for (var i = 0; i < relation.Columns.Count; i++)
+            names[i] = relation.Columns[i].Name;
+        return names;
     }
 
     private sealed record PendingEvent(Guid Id, string Topic, string BodyJson, DateTimeOffset CreatedAtUtc);
