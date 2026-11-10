@@ -36,22 +36,6 @@ public sealed class KafkaOptions
 
     /// <summary>Имя consumer-группы (видно в Kafka; оффсеты НЕ коммитятся).</summary>
     public string GroupId { get; set; } = "kafka-validator";
-
-    /// <summary>Буфер KafkaFlow на воркер (записей).</summary>
-    public int BufferSize { get; set; } = 1000;
-
-    public int ClampBufferSize() => Math.Clamp(BufferSize, 100, 100_000);
-
-    /// <summary>
-    /// Число воркеров обработки. По умолчанию 1: записи одного прогона идут
-    /// последовательно, состояние реестра под lock — параллелизм не нужен.
-    /// </summary>
-    public int WorkersCount { get; set; } = 1;
-
-    public int ClampWorkersCount() => Math.Clamp(WorkersCount, 1, 16);
-
-    public string[] BrokerList() =>
-        Brokers.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 }
 
 public sealed class EndpointOptions

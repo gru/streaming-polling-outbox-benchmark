@@ -12,11 +12,9 @@
     <!-- Npgsql не нужен: валидатор не подключается к PostgreSQL — он сверяет
          фактическое содержимое Kafka topic с ожидаемым набором id, который
          отдаёт Writer (requirements.md 15). -->
-    <!-- KafkaFlow 4.2.0 — единая зафиксированная версия для всех сервисов
-         (requirements.md 9); здесь используется сторона consumer. -->
-    <PackageReference Include="KafkaFlow" Version="4.2.0" />
-    <PackageReference Include="KafkaFlow.Extensions.Hosting" Version="4.2.0" />
-    <PackageReference Include="KafkaFlow.LogHandler.Console" Version="4.2.0" />
+    <!-- Confluent.Kafka 2.3.0 — единственный Kafka-клиент (как в streaming-outbox);
+         здесь используется сторона consumer. KafkaFlow 4.2.0 убран (deviations 9н). -->
+    <PackageReference Include="Confluent.Kafka" Version="2.3.0" />
     <!-- OTel 1.9.0 + Prometheus exporter (pull, /metrics) — как у Writer/CDC. -->
     <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.9.0" />
     <PackageReference Include="OpenTelemetry.Exporter.Prometheus.AspNetCore" Version="1.9.0-beta.2" />

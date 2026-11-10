@@ -1,3 +1,5 @@
+using CdcKafka;
+
 namespace CdcStreaming.Configuration;
 
 /// <summary>
@@ -12,10 +14,12 @@ namespace CdcStreaming.Configuration;
 ///   Streaming.ChannelCapacity — ёмкость внутреннего канала receiver→publisher
 ///                              (backpressure: заполненный канал останавливает
 ///                              чтение стрима, WAL копится на сервере).
-/// Это ТРИ разных «батча»: внутренний batching Confluent-продюсера (LingerMs),
+/// Это ТРИ разных «батча»: внутренний batching librdkafka (LingerMs),
 /// прикладной batch Kafka и канал декодированных событий — не путать с
 /// подтверждением LSN, которое выполняется replication feedback'ом после
 /// доставки всего flush-набора.
+/// Kafka — общий класс KafkaPublishOptions (CdcKafka): параметры публикации
+/// идентичны CdcPolling, бенчмарк сравнивает только чтение outbox.
 /// </summary>
 public sealed class CdcStreamingOptions
 {
@@ -23,7 +27,7 @@ public sealed class CdcStreamingOptions
 
     public ConnectionOptions Connection { get; set; } = new();
     public StreamingOptions Streaming { get; set; } = new();
-    public KafkaOptions Kafka { get; set; } = new();
+    public KafkaPublishOptions Kafka { get; set; } = new();
     public RetryOptions Retry { get; set; } = new();
 }
 
@@ -79,27 +83,6 @@ public sealed class StreamingOptions
     public int ChannelCapacity { get; set; } = 2048;
 
     public int ClampChannelCapacity() => Math.Clamp(ChannelCapacity, 16, 1_000_000);
-}
-
-public sealed class KafkaOptions
-{
-    public string Brokers { get; set; } = "kafka1:9092";
-    public string Topic { get; set; } = "outbox.events";
-
-    /// <summary>Прикладной batch: максимум событий, публикуемых одним flush-циклом.</summary>
-    public int BatchSize { get; set; } = 100;
-
-    /// <summary>Внутренний batching Confluent-продюсера (linger.ms).</summary>
-    public double LingerMs { get; set; } = 5;
-
-    /// <summary>
-    /// message.timeout.ms: сколько ждать доставки сообщения прежде чем признать
-    /// публикацию неуспешной (недоступная Kafka обнаруживается за это время).
-    /// </summary>
-    public int MessageTimeoutMs { get; set; } = 15_000;
-
-    public string[] BrokerList() =>
-        Brokers.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 }
 
 public sealed class RetryOptions

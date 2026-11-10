@@ -1,8 +1,6 @@
 using CdcCommon;
-using KafkaFlow;
 using KafkaValidator.Metrics;
 using KafkaValidator.Validation;
-using Microsoft.Extensions.Options;
 
 namespace KafkaValidator.Kafka;
 
@@ -10,9 +8,10 @@ namespace KafkaValidator.Kafka;
 /// Обработка каждой записи topic: разбор конверта → body.runId → счётчики
 /// реестра. Полная логика вердикта — в VerdictComputer (чистая, unit-тесты);
 /// handler максимально тонкий: потребление никогда не падает (битая запись —
-/// счётчик parse_errors, не сбой консюмера).
+/// счётчик parse_errors, не сбой консюмера). Вызывается из
+/// ValidatorConsumerService (Confluent.Kafka, без KafkaFlow).
 /// </summary>
-public sealed class ValidationHandler : IMessageHandler<byte[]>
+public sealed class ValidationHandler
 {
     private readonly RunRegistry _registry;
     private readonly KafkaValidatorMetrics _metrics;
@@ -23,7 +22,7 @@ public sealed class ValidationHandler : IMessageHandler<byte[]>
         _metrics = metrics;
     }
 
-    public Task Handle(IMessageContext context, byte[] message)
+    public Task Handle(byte[] message)
     {
         _metrics.RecordsConsumed.Add(1);
 

@@ -1,15 +1,17 @@
 # CdcPolling: multi-stage build .NET 8 (requirements.md 7 — строго net8.0).
-# Контекст сборки — ./src: сервис ссылается на библиотеку CdcCommon.
+# Контекст сборки — ./src: сервис ссылается на библиотеки CdcCommon и CdcKafka.
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /src
 
 # Слой restore кэшируется отдельно от исходников
 COPY CdcPolling/CdcPolling.csproj CdcPolling/
 COPY CdcCommon/CdcCommon.csproj CdcCommon/
+COPY CdcKafka/CdcKafka.csproj CdcKafka/
 RUN dotnet restore CdcPolling/CdcPolling.csproj
 
 COPY CdcPolling/ CdcPolling/
 COPY CdcCommon/ CdcCommon/
+COPY CdcKafka/ CdcKafka/
 RUN dotnet publish CdcPolling/CdcPolling.csproj -c Release -o /app /p:UseAppHost=false
 
 FROM mcr.microsoft.com/dotnet/aspnet:8.0

@@ -5,8 +5,8 @@ namespace KafkaValidator.Validation;
 
 /// <summary>
 /// Состояние сервиса и снимок для GET /api/validation/state. Коды состояний —
-/// числа CDC-сервисов: starting → running (после старта KafkaFlow-шины;
-/// консюмер группы без сохранения оффсетов уже читает topic с начала) →
+/// числа CDC-сервисов: starting → running (после старта консюмера
+/// ValidatorConsumerService; оффсеты не коммитятся, topic читается с начала) →
 /// stopped/failed.
 /// </summary>
 public sealed class ValidatorEngine
@@ -80,7 +80,7 @@ public sealed record ValidatorStateSnapshot(
 public sealed record ConfigEcho(string Brokers, string Topic, string GroupId, string WriterBaseUrl);
 
 /// <summary>
-/// running выставляется ПОСЛЕ старта hosted-сервиса KafkaFlow (hosted-сервисы
+/// running выставляется ПОСЛЕ старта ValidatorConsumerService (hosted-сервисы
 /// стартуют в порядке регистрации — этот регистрируется позже). Готовность не
 /// зависит от наличия записей: на пустом topic (свежий стенд) валидатор тоже
 /// готов — просто ещё нечего сверять.

@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>CdcKafka</RootNamespace>
+    <AssemblyName>CdcKafka</AssemblyName>
+  </PropertyGroup>
+
+  <!-- Confluent.Kafka 2.3.0 — единственный Kafka-клиент решения (как в
+       streaming-outbox). KafkaFlow 4.2.0 убран (этап 8, deviations 9н): стек
+       KafkaFlow+Confluent.Kafka нативно SIGSEGV (exit 139) при полной потере
+       Kafka-брокеров после любой продукции — воспроизводимо на linux/arm64.
+       CdcCommon остаётся чистой BCL-библиотекой: Kafka-клиент живёт здесь. -->
+
+  <ItemGroup>
+    <PackageReference Include="Confluent.Kafka" Version="2.3.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CdcCommon\CdcCommon.csproj" />
+  </ItemGroup>
+
+</Project>

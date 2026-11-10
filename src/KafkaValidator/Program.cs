@@ -1,5 +1,4 @@
 using System.Text.Json;
-using KafkaFlow;
 using KafkaValidator.Configuration;
 using KafkaValidator.Kafka;
 using KafkaValidator.Metrics;
@@ -27,39 +26,9 @@ builder.Services.AddHttpClient<WriterClient>((sp, http) =>
 });
 builder.Services.AddHttpClient<CdcClient>();
 
-// KafkaFlow — consumer topic outbox.events (requirements.md 15). Ключевая
-// семантика: группа kafka-validator + Earliest + WithoutStoringOffsets —
-// оффсеты НИКОГДА не коммитятся (в KafkaFlow это NullOffsetCommitter/
-// NullOffsetManager), поэтому каждый старт процесса перематывает topic с
-// начала и полностью восстанавливает счётчики всех прогонов. Закоммиченные
-// оффсеты после рестарта «съели» бы историю — и валидатор ложно сообщил бы
-// о потерях. Побочный эффект: kafka_consumergroup_lag для этой группы не
-// возникает (нет закоммиченных оффсетов) — §13.3 «если применимо»,
-// см. docs/deviations.md 8.
-var kafkaBrokers = (builder.Configuration["KafkaValidator:Kafka:Brokers"] ?? "kafka1:9092")
-    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-var kafkaTopic = builder.Configuration["KafkaValidator:Kafka:Topic"] ?? "outbox.events";
-var kafkaGroupId = builder.Configuration["KafkaValidator:Kafka:GroupId"] ?? "kafka-validator";
-var bufferSize = int.TryParse(builder.Configuration["KafkaValidator:Kafka:BufferSize"], out var bs) ? Math.Clamp(bs, 100, 100_000) : 1000;
-var workersCount = int.TryParse(builder.Configuration["KafkaValidator:Kafka:WorkersCount"], out var wc) ? Math.Clamp(wc, 1, 16) : 1;
-
-builder.Services.AddKafkaFlowHostedService(kafka => kafka
-    .UseConsoleLog()
-    .AddCluster(cluster => cluster
-        .WithBrokers(kafkaBrokers)
-        .AddConsumer(consumer => consumer
-            .Topic(kafkaTopic)
-            .WithGroupId(kafkaGroupId)
-            .WithAutoOffsetReset(AutoOffsetReset.Earliest)
-            .WithoutStoringOffsets()
-            .WithBufferSize(bufferSize)
-            .WithWorkersCount(workersCount)
-            .AddMiddlewares(m => m
-                .AddDeserializer<PassthroughDeserializer>()
-                .AddTypedHandlers(h => h.AddHandler<ValidationHandler>())))));
-
-// ПОСЛЕ AddKafkaFlowHostedService: hosted-сервисы стартуют в порядке
-// регистрации — running выставляется, когда шина (и консюмер) уже запущены
+// ПОСЛЕ ValidatorConsumerService: hosted-сервисы стартуют в порядке
+// регистрации — running выставляется, когда консюмер уже запущен
+builder.Services.AddHostedService<ValidatorConsumerService>();
 builder.Services.AddHostedService<ValidatorLifecycleHostedService>();
 
 builder.Services.AddOpenTelemetry()
@@ -127,7 +96,7 @@ app.MapPost("/api/validation/validate", async (HttpRequest http, ValidationServi
 
 app.MapGet("/health", () => Results.Ok(new { status = "Healthy" }));
 
-// ready = KafkaFlow-шина запущена (консюмер группы уже читает topic с начала);
+// ready = консюмер запущен (группа уже читает topic с начала);
 // пустой topic — тоже ready: сверять пока нечего, но сервис работоспособен
 app.MapGet("/ready", (ValidatorEngine engine) => engine.State == "running"
     ? Results.Ok(new { status = "Ready" })

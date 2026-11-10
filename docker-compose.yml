@@ -389,7 +389,7 @@ services:
   # ---------- CDC Polling (этап 4) ----------
 
   # Читает слот через SECURITY DEFINER peek/advance (sys_app, БД outbox),
-  # публикует в Kafka (KafkaFlow) и подтверждает LSN только после Kafka delivery.
+  # публикует в Kafka (Confluent.Kafka) и подтверждает LSN только после Kafka delivery.
   # Profile polling: сервис не стартует обычным `docker compose up` — Polling и
   # Streaming никогда не работают на одном слоте одновременно (requirements.md 11).
   # Запуск: docker compose --profile polling up -d --build cdc-polling.
@@ -441,7 +441,7 @@ services:
   # Читает слот Npgsql Logical Replication API (PgOutputReplicationSlot, pgoutput
   # proto v1) от sys_replication — НАПРЯМУЮ через haproxy:5432 (PgBouncer
   # replication-протокол не проксирует, requirements.md 3.3). Публикует в Kafka
-  # (KafkaFlow) и подтверждает LSN replication feedback'ом только после Kafka
+  # (Confluent.Kafka) и подтверждает LSN replication feedback'ом только после Kafka
   # delivery. Profile streaming: Polling и Streaming никогда не работают на одном
   # слоте одновременно (requirements.md 11); перед запуском остановить cdc-polling.
   # Запуск: docker compose --profile streaming up -d --build cdc-streaming.

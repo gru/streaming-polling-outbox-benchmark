@@ -1,9 +1,7 @@
-using Confluent.Kafka;
+using CdcKafka;
 using CdcPolling.Configuration;
-using CdcPolling.Kafka;
 using CdcPolling.Metrics;
 using CdcPolling.Polling;
-using KafkaFlow;
 using Microsoft.Extensions.Options;
 using OpenTelemetry.Metrics;
 
@@ -15,30 +13,10 @@ builder.Services.AddSingleton(sp => sp.GetRequiredService<IOptions<CdcPollingOpt
 
 builder.Services.AddSingleton<CdcPollingMetrics>();
 builder.Services.AddSingleton<SlotGateway>();
-builder.Services.AddSingleton<KafkaPublisher>();
-
-// KafkaFlow — основной API публикации (requirements.md 9); topic НЕ создаётся
-// автоматически (requirements.md 3.2: topic создаёт kafka-init).
-var kafkaBrokers = (builder.Configuration["CdcPolling:Kafka:Brokers"] ?? "kafka1:9092")
-    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-var kafkaTopic = builder.Configuration["CdcPolling:Kafka:Topic"] ?? "outbox.events";
-var kafkaLingerMs = double.TryParse(builder.Configuration["CdcPolling:Kafka:LingerMs"], out var linger) ? linger : 5.0;
-var kafkaMessageTimeoutMs = int.TryParse(builder.Configuration["CdcPolling:Kafka:MessageTimeoutMs"], out var timeoutMs) ? timeoutMs : 15_000;
-
-builder.Services.AddKafkaFlowHostedService(kafka => kafka
-    .UseConsoleLog()
-    .AddCluster(cluster => cluster
-        .WithBrokers(kafkaBrokers)
-        .AddProducer(KafkaPublisher.ProducerName, producer => producer
-            .DefaultTopic(kafkaTopic)
-                .WithAcks(KafkaFlow.Acks.All)
-            .WithProducerConfig(new ProducerConfig
-            {
-                EnableIdempotence = true,
-                LingerMs = kafkaLingerMs,
-                MessageTimeoutMs = kafkaMessageTimeoutMs,
-            })
-            .AddMiddlewares(m => m.AddSerializer<PassthroughSerializer>()))));
+// Публикация: чистый Confluent.Kafka (общий CdcKafka, как в streaming-outbox);
+// topic НЕ создаётся автоматически (requirements.md 3.2: topic создаёт kafka-init)
+builder.Services.AddSingleton(sp => sp.GetRequiredService<IOptions<CdcPollingOptions>>().Value.Kafka);
+builder.Services.AddSingleton<OutboxKafkaPublisher>();
 
 // цикл peek → publish → advance стартует сразу и работает непрерывно
 builder.Services.AddSingleton<CdcPollingEngine>();

@@ -3,7 +3,7 @@ using System.Net.Sockets;
 using CdcCommon;
 using CdcCommon.PgOutput;
 using CdcPolling.Configuration;
-using CdcPolling.Kafka;
+using CdcKafka;
 using CdcPolling.Metrics;
 using Microsoft.Extensions.Options;
 using Npgsql;
@@ -41,7 +41,7 @@ public sealed class CdcPollingEngine : BackgroundService
 
     private readonly CdcPollingOptions _options;
     private readonly SlotGateway _gateway;
-    private readonly KafkaPublisher _publisher;
+    private readonly OutboxKafkaPublisher _publisher;
     private readonly CdcPollingMetrics _metrics;
     private readonly ILogger<CdcPollingEngine> _logger;
 
@@ -67,7 +67,7 @@ public sealed class CdcPollingEngine : BackgroundService
     public CdcPollingEngine(
         IOptions<CdcPollingOptions> options,
         SlotGateway gateway,
-        KafkaPublisher publisher,
+        OutboxKafkaPublisher publisher,
         CdcPollingMetrics metrics,
         ILogger<CdcPollingEngine> logger)
     {
@@ -131,7 +131,7 @@ public sealed class CdcPollingEngine : BackgroundService
         var mode = _options.Connection.Mode;
         var pollBatch = _options.Poll.ClampBatchSize();
         var idle = TimeSpan.FromMilliseconds(Math.Max(50, _options.Poll.IdleIntervalMs));
-        var kafkaBatch = Math.Max(1, _options.Kafka.BatchSize);
+        var kafkaBatch = _options.Kafka.ClampBatchSize();
         var backoffBase = Math.Max(50, _options.Retry.BaseDelayMs);
         var backoffCap = Math.Max(backoffBase, _options.Retry.MaxDelayMs);
 
@@ -560,14 +560,5 @@ public sealed class CdcPollingEngine : BackgroundService
         "55006",                                               // object_in_use: конкурентный peek/advance на слоте
     };
 
-    private static string ClassifyKafkaError(Exception ex) => ex switch
-    {
-        TimeoutException => "timeout",
-        { } e when IsProduceException(e) => "produce",
-        _ => "other",
-    };
-
-    private static bool IsProduceException(Exception ex) =>
-        ex.GetType().FullName?.Contains("ProduceException") == true ||
-        ex.GetType().FullName?.Contains("KafkaFlowException") == true;
+    private static string ClassifyKafkaError(Exception ex) => KafkaErrorClassifier.Classify(ex);
 }
