@@ -26,8 +26,9 @@ builder.Services.AddOpenTelemetry()
 
 var app = builder.Build();
 
-app.Logger.LogInformation("Writer запускается; режим подключения по умолчанию: {Mode}",
-    app.Configuration["Writer:Connection:Mode"] ?? "pgbouncer");
+app.Logger.LogInformation("Writer запускается; подключение напрямую через {Host}:{Port} (мимо PgBouncer)",
+    app.Configuration["Writer:Connection:Endpoint:Host"] ?? "haproxy",
+    app.Configuration["Writer:Connection:Endpoint:Port"] ?? "5432");
 
 // ---------- Управление генерацией (requirements.md 6.1) ----------
 
@@ -47,7 +48,7 @@ app.MapPost("/api/generation/start", async (HttpRequest http, IOptions<WriterOpt
 
     var (ok, error) = engine.Start(profile);
     return ok
-        ? Results.Accepted("/api/generation/state", new { runId = profile.RunId, profile.ConnectionMode, profile })
+        ? Results.Accepted("/api/generation/state", new { runId = profile.RunId, profile })
         : Results.Conflict(new { error });
 });
 
@@ -71,19 +72,17 @@ app.MapGet("/api/generation/results/ids", (GenerationEngine engine) =>
 
 app.MapGet("/health", () => Results.Ok(new { status = "Healthy" }));
 
-// ready = процесс жив и может писать в БД в активном режиме подключения;
+// ready = процесс жив и может писать в БД;
 // SELECT 1 не требует привилегий на таблицы — годится для sys_writer
-app.MapGet("/ready", async (OutboxWriter db, IOptions<WriterOptions> options) =>
+app.MapGet("/ready", async (OutboxWriter db) =>
 {
-    var mode = options.Value.Connection.Mode;
     try
     {
         using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
-        var source = db.SourceFor(mode);
-        await using var conn = await source.OpenConnectionAsync(timeoutCts.Token);
+        await using var conn = await db.Source.OpenConnectionAsync(timeoutCts.Token);
         await using var cmd = new NpgsqlCommand("SELECT 1", conn);
         await cmd.ExecuteScalarAsync(timeoutCts.Token);
-        return Results.Ok(new { status = "Ready", connectionMode = mode });
+        return Results.Ok(new { status = "Ready" });
     }
     catch (Exception ex)
     {

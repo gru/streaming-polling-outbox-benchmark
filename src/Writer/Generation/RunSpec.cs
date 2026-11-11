@@ -17,7 +17,6 @@ public sealed class RunSpec
     public int? RatePerSecond { get; set; }
     public int? Parallelism { get; set; }
     public int? BatchSize { get; set; }
-    public string? ConnectionMode { get; set; }
 
     /// <summary>
     /// insertDelete (дефолт: INSERT+DELETE в одной транзакции, таблица пустая,
@@ -36,7 +35,6 @@ public sealed class RunSpec
 public sealed record LoadProfile
 {
     public required Guid RunId { get; init; }
-    public required string ConnectionMode { get; init; }
     public required int MessageSizeBytes { get; init; }
     public required int? RatePerSecond { get; init; }
     public required int Parallelism { get; init; }
@@ -66,7 +64,6 @@ public sealed record LoadProfile
         var profile = new LoadProfile
         {
             RunId = r?.RunId ?? Guid.NewGuid(),
-            ConnectionMode = (r?.ConnectionMode ?? options.Connection.Mode ?? "").Trim().ToLowerInvariant(),
             MessageSizeBytes = r?.MessageSizeBytes ?? d.MessageSizeBytes,
             RatePerSecond = r?.RatePerSecond ?? d.RatePerSecond,
             Parallelism = r?.Parallelism ?? d.Parallelism,
@@ -78,8 +75,6 @@ public sealed record LoadProfile
             RunUntilStopped = r?.RunUntilStopped ?? d.RunUntilStopped,
         };
 
-        if (profile.ConnectionMode is not ("pgbouncer" or "direct"))
-            errors.Add($"connectionMode должен быть 'pgbouncer' или 'direct', получено '{profile.ConnectionMode}'");
         if (profile.WriteMode is not (WriteModes.InsertDelete or WriteModes.InsertOnly))
             errors.Add($"writeMode должен быть '{WriteModes.InsertDelete}' или '{WriteModes.InsertOnly}', получено '{profile.WriteMode}'");
         if (profile.MessageSizeBytes is < 1 or > 10_000_000)

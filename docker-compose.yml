@@ -363,11 +363,10 @@ services:
     image: streaming-polling-outbox/writer:net8.0
     environment:
       ASPNETCORE_URLS: http://+:8080
-      WRITER__CONNECTION__MODE: ${WRITER_CONNECTION_MODE:-pgbouncer}
-      WRITER__CONNECTION__PGBOUNCER__HOST: pgbouncer
-      WRITER__CONNECTION__PGBOUNCER__PORT: "6432"
-      WRITER__CONNECTION__DIRECT__HOST: haproxy
-      WRITER__CONNECTION__DIRECT__PORT: "5432"
+      # Напрямую через HAProxy (мимо PgBouncer): его default_pool_size=20
+      # ограничивал writer при parallelism > 20 (замер этапа 9)
+      WRITER__CONNECTION__ENDPOINT__HOST: haproxy
+      WRITER__CONNECTION__ENDPOINT__PORT: "5432"
       WRITER__CONNECTION__DATABASE__NAME: outbox
       WRITER__CONNECTION__DATABASE__USERNAME: sys_writer
       WRITER__CONNECTION__DATABASE__PASSWORD: ${SYS_WRITER_PASSWORD:?set in .env}
@@ -387,7 +386,6 @@ services:
     stop_grace_period: 30s
     depends_on:
       haproxy: {condition: service_healthy}
-      pgbouncer: {condition: service_healthy}
 
   # ---------- CDC Polling (этап 4) ----------
 

@@ -2,9 +2,9 @@ namespace Writer.Configuration;
 
 /// <summary>
 /// Конфигурация Writer (секция "Writer", env-префикс WRITER__).
-/// Режим подключения по умолчанию задаётся конфигом (pgbouncer | direct) и может
-/// переопределяться в каждом запросе /api/generation/start — смены режима без
-/// изменения кода (requirements.md 3.3, 6.2).
+/// Подключение — всегда напрямую через HAProxy к актуальному primary
+/// (мимо PgBouncer: его default_pool_size=20 ограничивал writer при высоком
+/// parallelism, замер этапа 9; PgBouncer в стенде остался для CDC polling/competing).
 /// </summary>
 public sealed class WriterOptions
 {
@@ -16,11 +16,8 @@ public sealed class WriterOptions
 
 public sealed class ConnectionOptions
 {
-    /// <summary>pgbouncer | direct (диагностическое прямое подключение к primary).</summary>
-    public string Mode { get; set; } = "pgbouncer";
-
-    public EndpointOptions Pgbouncer { get; set; } = new() { Host = "pgbouncer", Port = 6432 };
-    public EndpointOptions Direct { get; set; } = new() { Host = "haproxy", Port = 5432 };
+    /// <summary>Единственный endpoint (без переключателя режимов, по образцу CdcStreaming).</summary>
+    public EndpointOptions Endpoint { get; set; } = new() { Host = "haproxy", Port = 5432 };
     public DatabaseOptions Database { get; set; } = new();
 }
 

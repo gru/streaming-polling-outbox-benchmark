@@ -171,8 +171,8 @@ public sealed class GenerationEngine : IHostedService
     {
         var p = ctx.Profile;
         _logger.LogInformation(
-            "Прогон {RunId} стартовал: mode={Mode} rate={Rate} msg/s batch={Batch} par={Par} size={Size}B цели: count={Count} bytes={Bytes}B dur={Dur}s",
-            p.RunId, p.ConnectionMode, p.RatePerSecond?.ToString() ?? "unlimited", p.BatchSize, p.Parallelism,
+            "Прогон {RunId} стартовал: rate={Rate} msg/s batch={Batch} par={Par} size={Size}B цели: count={Count} bytes={Bytes}B dur={Dur}s",
+            p.RunId, p.RatePerSecond?.ToString() ?? "unlimited", p.BatchSize, p.Parallelism,
             p.MessageSizeBytes, p.TotalMessages?.ToString() ?? "-", p.TotalPayloadBytes?.ToString() ?? "-",
             p.DurationSeconds?.ToString() ?? "-");
 
@@ -257,7 +257,7 @@ public sealed class GenerationEngine : IHostedService
     {
         try
         {
-            var res = await _db.WriteBatchAsync(ctx.Profile.ConnectionMode,
+            var res = await _db.WriteBatchAsync(
                 ctx.Profile.WriteMode == WriteModes.InsertOnly, messages, ctx.HardCts.Token, ctx.StopCts.Token);
             var ids = messages.Select(m => m.Id).ToArray();
             var reconnects = Math.Max(0, res.Attempts - 1);
@@ -398,7 +398,6 @@ public sealed class GenerationEngine : IHostedService
         var results = new RunResults
         {
             RunId = p.RunId,
-            ConnectionMode = p.ConnectionMode,
             Profile = p,
             State = state,
             StopReason = reason,

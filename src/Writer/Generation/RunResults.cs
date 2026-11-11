@@ -26,7 +26,6 @@ public sealed class RunStateSnapshot
 public sealed class RunResults
 {
     public Guid RunId { get; set; }
-    public string ConnectionMode { get; set; } = "";
     public LoadProfile? Profile { get; set; }
 
     /// <summary>completed | failed | stopped</summary>
