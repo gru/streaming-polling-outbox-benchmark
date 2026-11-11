@@ -135,6 +135,7 @@ pg_snap() { # out_json
 SELECT json_build_object(
   'statements', (SELECT coalesce(json_agg(row_to_json(s)), '[]'::json) FROM (
       SELECT coalesce(queryid::text, ' utility') AS queryid,
+             pg_get_userbyid(userid) AS rolname,
              left(query, 200) AS query, calls,
              round(total_exec_time::numeric, 1) AS total_exec_ms,
              round(mean_exec_time::numeric, 3) AS mean_exec_ms, rows,
@@ -383,7 +384,7 @@ if pg_before and pg_after:
     stmts = []
     for a in pg_after.get("statements") or []:
         b = bmap.get(a["queryid"], {})
-        d = {"queryid": a["queryid"], "query": a["query"]}
+        d = {"queryid": a["queryid"], "query": a["query"], "rolname": a.get("rolname")}
         for k in STMT_F:
             d["d_" + k] = round(fnum(a.get(k)) - fnum(b.get(k)), 3)
         if any(d["d_" + k] for k in STMT_F):
@@ -393,13 +394,25 @@ if pg_before and pg_after:
              and "json_build_object" not in s["query"]]
     for s in stmts:
         s["mean_exec_ms"] = round(s["d_total_exec_ms"] / s["d_calls"], 3) if s["d_calls"] else None
+        # роль по тексту запроса: Writer и drain различаются даже в DELETE
+        # (drain: DELETE … FOR UPDATE SKIP LOCKED … RETURNING; Writer insertDelete:
+        # DELETE … WHERE id = ANY($1)). peek/advance — SECURITY DEFINER-обёртки
+        # polling-CDC (exec time внешнего SELECT включает работу функции).
         q = s["query"].lstrip()
-        if q.startswith("DELETE"):
-            s["role"] = "drain-delete" if "outbox_messages" in q else "delete"
-        elif q.startswith("INSERT"):
-            s["role"] = "writer-insert" if "outbox_messages" in q else "insert"
-        elif "outbox_messages" in q:
-            s["role"] = "outbox-other"
+        ql = q.lower()
+        if "outbox_messages" in ql:
+            if q.startswith("DELETE"):
+                s["role"] = "drain-delete" if ("skip locked" in ql or "returning" in ql) else "writer-delete"
+            elif q.startswith("INSERT"):
+                s["role"] = "writer-insert"
+            else:
+                s["role"] = "outbox-other"
+        elif "peek_outbox_changes" in ql or "pg_logical_slot_peek" in ql:
+            s["role"] = "polling-peek"
+        elif "advance_outbox_slot" in ql or "pg_replication_slot_advance" in ql:
+            s["role"] = "polling-advance"
+        elif "outbox_slot_status" in ql:
+            s["role"] = "slot-status"
         else:
             s["role"] = "other"
     stmts.sort(key=lambda s: -s["d_total_exec_ms"])
@@ -655,7 +668,8 @@ def merge_pg(scens):
             continue
         for st in pg.get("statements") or []:
             m = out["statements"].setdefault(
-                st["queryid"], {"queryid": st["queryid"], "query": st["query"], "role": st.get("role")})
+                st["queryid"], {"queryid": st["queryid"], "query": st["query"],
+                                "rolname": st.get("rolname"), "role": st.get("role")})
             for k, v in st.items():
                 if k.startswith("d_"):
                     m[k] = round(m.get(k, 0) + v, 3)
@@ -850,6 +864,9 @@ for name in names:
             "drainDeleteMeanMs": next(
                 (st.get("mean_exec_ms") for st in (pick(s, "postgres", "statements") or [])
                  if st.get("role") == "drain-delete"), None),
+            "pollingPeekMeanMs": next(
+                (st.get("mean_exec_ms") for st in (pick(s, "postgres", "statements") or [])
+                 if st.get("role") == "polling-peek"), None),
         }
     rows.append(row)
 out = {"schema": "streaming-polling-outbox/benchmark-summary/v1", "arms": list(arms), "scenarios": rows}
