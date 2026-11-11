@@ -22,7 +22,9 @@ builder.Services.AddHttpClient<WriterClient>((sp, http) =>
 {
     var cfg = sp.GetRequiredService<IOptions<KafkaValidatorOptions>>().Value;
     http.BaseAddress = new Uri(cfg.Writer.BaseUrl.TrimEnd('/') + "/");
-    http.Timeout = TimeSpan.FromSeconds(5);
+    // fetchFromWriter-вердикт тянет весь ids-набор одним GET: 4M прогонов ≈ 160МБ
+    // JSON — 5с мало (это не health-check путь, обычные запросы быстрые)
+    http.Timeout = TimeSpan.FromSeconds(300);
 });
 builder.Services.AddHttpClient<CdcClient>();
 

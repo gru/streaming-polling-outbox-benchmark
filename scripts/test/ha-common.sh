@@ -188,9 +188,9 @@ wait_run_unique() { # runId expected → unique на stdout
   echo "${u:-0}"
 }
 validate_run() { # runId fetchFromWriter → HTTP-код, вердикт в /tmp/ha-verdict.json
-  # 120с: fetchFromWriter у больших прогонов тянет весь ids-набор с Writer
-  # (benchmark s5 1M сообщений ≈ 40МБ JSON) — 30с мало
-  curl -s -o /tmp/ha-verdict.json -w '%{http_code}' --max-time 120 -X POST "$VBASE/api/validation/validate" \
+  # 300с: fetchFromWriter у больших прогонов тянет весь ids-набор с Writer
+  # (benchmark s5 4M сообщений ≈ 160МБ JSON + диф множеств) — 30с/120с мало
+  curl -s -o /tmp/ha-verdict.json -w '%{http_code}' --max-time 300 -X POST "$VBASE/api/validation/validate" \
     -H 'Content-Type: application/json' -d "{\"runId\":\"$1\",\"fetchFromWriter\":$2}"
 }
 vd() { vfield /tmp/ha-verdict.json "$1"; }

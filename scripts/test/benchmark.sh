@@ -67,14 +67,14 @@ SCEN_DESCS=(
   "равномерная высокая нагрузка 60000@200/s (5 мин)"
   "backlog-drain: burst 20000 без rate-limit (короткий по смыслу: скорость выборки)"
   "крупные сообщения 15000@50/s x4096B (5 мин)"
-  "max throughput: backlog 400000 без rate-limit — Writer вываливает его за секунды (замерено 67-108k msg/s), CDC выбирает на пределе; узкое место — сам CDC по построению. Объём подобран под МЕДЛЕННУЮ реализацию: polling дрейнит большой backlog устойчиво ~0.9k msg/s (замер цикла A: 400k за 425с), streaming ~11k (400k за 31с) — 1M у polling занял бы ~18 мин и не влезал в бюджет ожидания; валидатор держит >=10k подтв/с (400k за 37с, цикл B)"
+  "max throughput, pre-seeded backlog 4000000 без rate-limit: Writer пишет при ОСТАНОВЛЕННОМ CDC (напрямую через HAProxy, ~110-150k msg/s — из измерения исключено), после завершения записи CDC стартует и дрейнит чисто; узкое место по построению — только CDC. Слот за время простоя не инвалидируется (max_slot_wal_keep_size=-1), WAL (~3ГБ) копится и выбирается после старта; drain считается с момента state=running (бут контейнера отдельно в cdcBootMs)"
 )
 SCEN_SPECS=(
   '{"totalMessages":30000,"ratePerSecond":50,"messageSizeBytes":256,"batchSize":50,"parallelism":4}'
   '{"totalMessages":60000,"ratePerSecond":200,"messageSizeBytes":256,"batchSize":50,"parallelism":4}'
   '{"totalMessages":20000,"messageSizeBytes":256,"batchSize":100,"parallelism":8}'
   '{"totalMessages":15000,"ratePerSecond":50,"messageSizeBytes":4096,"batchSize":50,"parallelism":4}'
-  '{"totalMessages":400000,"messageSizeBytes":256,"batchSize":100,"parallelism":8}'
+  '{"totalMessages":4000000,"messageSizeBytes":256,"batchSize":100,"parallelism":8}'
 )
 WARMUP_SPEC='{"totalMessages":500,"ratePerSecond":100,"messageSizeBytes":256,"batchSize":50,"parallelism":4}'
 
@@ -215,6 +215,27 @@ run_scenario() { # idx
   cdc_sampler "$CYCLE_DIR/cdc-samples/$name.tsv" &
   local sampler_pid=$!
 
+  # s5: pre-seeded backlog — Writer пишет при остановленном CDC, после завершения
+  # записи CDC стартует и дрейнит в чистом виде (скорость записи вне измерения,
+  # узкое место по построению — только CDC). Слот за время простоя не инвалидируется
+  # (max_slot_wal_keep_size=-1, patroni.yml) — WAL копится и выбирается после старта.
+  local pre_seed=0 t1c=""
+  [[ "$name" == s5-* ]] && pre_seed=1
+  if [[ "$pre_seed" == 1 ]]; then
+    $DC stop "cdc-$ARM" >/dev/null 2>&1
+    local cdc_ctr="streaming-polling-outbox-cdc-${ARM}-1" cdc_down=0
+    for _ in $(seq 1 30); do
+      [[ "$(docker inspect -f '{{.State.Running}}' "$cdc_ctr" 2>/dev/null)" == "false" ]] && { cdc_down=1; break; }
+      sleep 1
+    done
+    if [[ "$cdc_down" != 1 ]]; then
+      bad "$name: не удалось остановить cdc-$ARM за 30с"
+      rm -f /tmp/bench-sampler-on; wait "$sampler_pid" 2>/dev/null
+      return 1
+    fi
+    ok "$name: CDC остановлен — backlog пишется без потребителя (pre-seed)"
+  fi
+
   t0=$(now_ms)
   run=$(run_writer "$spec")
   t1=$(now_ms)
@@ -231,12 +252,32 @@ run_scenario() { # idx
   SCEN_WRITTEN="$written"
   ok "$name: written=$written, фактический rate=$(python3 -c "print(f'{$written / max($(writer_field 'd["durationSeconds"]'), 0.001):.0f}')") msg/s"
 
-  u=$(wait_run_unique_long "$run" "$written" 1800)
+  # s5: старт CDC после завершения записи — дрейн чистый, от момента state=running
+  if [[ "$pre_seed" == 1 ]]; then
+    $DC start "cdc-$ARM" >/dev/null 2>&1
+    if ! wait_cdc_state running 300; then
+      bad "$name: CDC не перешёл в running за 300с после старта: $(cdc_state_raw)"
+      rm -f /tmp/bench-sampler-on; wait "$sampler_pid" 2>/dev/null
+      return 1
+    fi
+    t1c=$(now_ms)
+    ok "$name: CDC поднят за $(( t1c - t1 ))мс — начинается дрейн"
+  fi
+
+  local wait_budget=1800
+  [[ "$pre_seed" == 1 ]] && wait_budget=5400
+  u=$(wait_run_unique_long "$run" "$written" "$wait_budget")
   t2=$(now_ms)
   rm -f /tmp/bench-sampler-on; wait "$sampler_pid" 2>/dev/null
-  [[ "$u" == "$written" ]] \
-    && ok "$name: доставка завершена: цикл $(( t2 - t0 ))мс, drain после Writer $(( t2 - t1 ))мс" \
-    || bad "$name: доставлено $u из $written за 900с"
+  if [[ "$pre_seed" == 1 ]]; then
+    [[ "$u" == "$written" ]] \
+      && ok "$name: доставка завершена: цикл $(( t2 - t0 ))мс = запись $(( t1 - t0 ))мс + бут CDC $(( t1c - t1 ))мс + дрейн $(( t2 - t1c ))мс" \
+      || bad "$name: доставлено $u из $written за ${wait_budget}с"
+  else
+    [[ "$u" == "$written" ]] \
+      && ok "$name: доставка завершена: цикл $(( t2 - t0 ))мс, drain после Writer $(( t2 - t1 ))мс" \
+      || bad "$name: доставлено $u из $written за ${wait_budget}с"
+  fi
 
   curl -s --max-time 10 "http://localhost:$CDC_PORT/api/cdc/state" -o /tmp/bench-cdc-after.json
   # pending-статистики postgres (table/db/wal) бэкенды флашат с задержкой:
@@ -271,7 +312,7 @@ run_scenario() { # idx
   # per-сценарный JSON: тайминги, дельты счётчиков, сэмплы доставки, CPU/RAM по ролям
   SCEN_JSON="$CYCLE_DIR/scenarios/$name.json"
   SCEN_NAME="$name" SCEN_DESC="$desc" SCEN_SPEC="$spec" SCEN_RUN_ID="$run" \
-  SCEN_T0="$t0" SCEN_T1="$t1" SCEN_T2="$t2" \
+  SCEN_T0="$t0" SCEN_T1="$t1" SCEN_T2="$t2" SCEN_T1C="$t1c" \
   E2E_SUM0="$e2e_sum0" E2E_CNT0="$e2e_cnt0" E2E_SUM1="$e2e_sum1" E2E_CNT1="$e2e_cnt1" \
   CDC_BEFORE="/tmp/bench-cdc-before.json" CDC_AFTER="/tmp/bench-cdc-after.json" \
   PG_BEFORE="/tmp/bench-pg-before.json" PG_AFTER="/tmp/bench-pg-after.json" PG_LEADER="$pg_leader" \
@@ -293,6 +334,9 @@ before = load(os.environ["CDC_BEFORE"], {})
 after = load(os.environ["CDC_AFTER"], {})
 verdict = load(os.environ["VERDICT_JSON"], {})
 t0, t1, t2 = (int(os.environ[k]) for k in ("SCEN_T0", "SCEN_T1", "SCEN_T2"))
+_t1c = os.environ.get("SCEN_T1C", "")
+t1c = int(_t1c) if _t1c.isdigit() else None
+pre_seeded = t1c is not None
 
 def f(d, k):
     v = d.get(k)
@@ -309,7 +353,11 @@ scen = {
         "t2EpochMs": t2,
         "writerMs": t1 - t0,
         "deliveryTotalMs": t2 - t0,       # старт записи → всё подтверждено валидатором
-        "drainMs": t2 - t1,               # Writer finished → всё доставлено
+                                         # (s5 pre-seed: включает фазу записи и бут CDC)
+        "drainMs": t2 - (t1c if pre_seeded else t1),
+                                         # s5 pre-seed: с момента старта CDC — чистый дрейн;
+                                         # остальные: Writer finished → всё доставлено
+        **({"cdcBootMs": t1c - t1, "preSeededBacklog": True} if pre_seeded else {}),
     },
     "writer": {
         "written": f(writer, "writtenMessages"),
@@ -329,12 +377,15 @@ scen = {
         "uniqueIds": (verdict.get("kafka") or {}).get("uniqueIds"),
     },
     "cdc": {
-        "deliveredDelta": f(after, "messagesDelivered") - f(before, "messagesDelivered"),
-        "readDelta": f(after, "messagesRead") - f(before, "messagesRead"),
-        "readErrors": f(after, "readErrors") - f(before, "readErrors"),
-        "kafkaErrors": f(after, "kafkaErrors") - f(before, "kafkaErrors"),
-        "retries": f(after, "retries") - f(before, "retries"),
-        "reconnects": f(after, "reconnects") - f(before, "reconnects"),
+        # pre-seed: контейнер CDC рестартован внутри сценария — счётчики in-memory
+        # обнулились, дельта от before (счётчики ПРОШЛОГО процесса) кривая (минус
+        # warmup-хвост); базой берём 0 — after и есть дельта текущего процесса
+        "deliveredDelta": f(after, "messagesDelivered") - (0 if pre_seeded else f(before, "messagesDelivered")),
+        "readDelta": f(after, "messagesRead") - (0 if pre_seeded else f(before, "messagesRead")),
+        "readErrors": f(after, "readErrors") - (0 if pre_seeded else f(before, "readErrors")),
+        "kafkaErrors": f(after, "kafkaErrors") - (0 if pre_seeded else f(before, "kafkaErrors")),
+        "retries": f(after, "retries") - (0 if pre_seeded else f(before, "retries")),
+        "reconnects": f(after, "reconnects") - (0 if pre_seeded else f(before, "reconnects")),
         "walLagBytesAfter": after.get("walLagBytes"),
         "e2eP50Ms": after.get("e2eP50Ms"), "e2eP95Ms": after.get("e2eP95Ms"), "e2eP99Ms": after.get("e2eP99Ms"),
     },
@@ -344,6 +395,10 @@ scen = {
 try:
     ds = float(os.environ["E2E_SUM1"]) - float(os.environ["E2E_SUM0"])
     dc = float(os.environ["E2E_CNT1"]) - float(os.environ["E2E_CNT0"])
+    if pre_seeded:
+        # рестарт CDC обнулил гистограмму: sum/cnt после — это ВЕСЬ дрен-процесс,
+        # дельта с before (warmup-хвост старого процесса) только занижала бы mean
+        ds, dc = float(os.environ["E2E_SUM1"]), float(os.environ["E2E_CNT1"])
     if dc > 0:
         scen["cdc"]["e2eMeanMs"] = round(ds / dc, 1)
         scen["cdc"]["e2eSamples"] = int(dc)
