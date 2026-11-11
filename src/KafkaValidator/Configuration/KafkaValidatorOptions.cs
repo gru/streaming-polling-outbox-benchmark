@@ -26,6 +26,9 @@ public sealed class KafkaValidatorOptions
 
     /// <summary>CDC Streaming HTTP API (обогащение вердикта, profile streaming).</summary>
     public EndpointOptions CdcStreaming { get; set; } = new() { BaseUrl = "http://cdc-streaming:8080" };
+
+    /// <summary>CDC Competing HTTP API (обогащение вердикта, profile competing).</summary>
+    public EndpointOptions CdcCompeting { get; set; } = new() { BaseUrl = "http://cdc-competing:8080" };
 }
 
 public sealed class KafkaOptions

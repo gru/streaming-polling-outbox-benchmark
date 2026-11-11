@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>CdcCompeting</RootNamespace>
+    <AssemblyName>CdcCompeting</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Npgsql 8.0.x — та же линия, что у Writer/CdcPolling. -->
+    <PackageReference Include="Npgsql" Version="8.0.9" />
+    <!-- Kafka-клиент: Confluent.Kafka 2.3.0 через общий проект CdcKafka (единый путь
+         записи в Kafka для всех arm — бенчмарк сравнивает только чтение outbox). -->
+    <!-- OTel 1.9.0 + Prometheus exporter (pull, /metrics) — как у CdcPolling. -->
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.9.0" />
+    <PackageReference Include="OpenTelemetry.Exporter.Prometheus.AspNetCore" Version="1.9.0-beta.2" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.Runtime" Version="1.9.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CdcCommon\CdcCommon.csproj" />
+    <ProjectReference Include="..\CdcKafka\CdcKafka.csproj" />
+  </ItemGroup>
+
+</Project>

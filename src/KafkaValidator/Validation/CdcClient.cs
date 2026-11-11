@@ -5,7 +5,7 @@ namespace KafkaValidator.Validation;
 /// <summary>
 /// Обогащение вердикта снапшотом CDC-сервиса (§15: «количество сообщений,
 /// подтверждённых CDC» — из фактических данных API, не из Prometheus).
-/// Профили polling/streaming взаимоисключающие (requirements.md 11):
+/// Профили polling/streaming/competing взаимоисключающие (requirements.md 11):
 /// отвечает максимум один; ни один (CDC остановлен) → null.
 /// </summary>
 public sealed class CdcClient
@@ -27,6 +27,7 @@ public sealed class CdcClient
                  {
                      ("polling", _options.CdcPolling.BaseUrl),
                      ("streaming", _options.CdcStreaming.BaseUrl),
+                     ("competing", _options.CdcCompeting.BaseUrl),
                  })
         {
             if (string.IsNullOrWhiteSpace(baseUrl))

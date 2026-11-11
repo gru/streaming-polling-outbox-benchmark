@@ -220,6 +220,7 @@ services:
       SYS_APP_PASSWORD: ${SYS_APP_PASSWORD:?set in .env}
       SYS_REPLICATION_PASSWORD: ${SYS_REPLICATION_PASSWORD:?set in .env}
       SYS_MONITOR_PASSWORD: ${SYS_MONITOR_PASSWORD:?set in .env}
+      SYS_DRAINER_PASSWORD: ${SYS_DRAINER_PASSWORD:?set in .env}
     volumes:
       - ./infrastructure/postgres/init:/init:ro
       - pgbouncer_config:/pgbouncer-config
@@ -232,13 +233,14 @@ services:
         until psql -h haproxy -U postgres -d postgres -tAc "SELECT pg_is_in_recovery()" 2>/dev/null | grep -q f; do
           sleep 2
         done
-        for f in /init/00-roles.sql /init/01-db-publication.sql /init/02-slot.sql /init/04-cdc-polling.sql /init/05-cdc-streaming.sql /init/06-monitoring.sql; do
+        for f in /init/00-roles.sql /init/01-db-publication.sql /init/02-slot.sql /init/04-cdc-polling.sql /init/05-cdc-streaming.sql /init/06-monitoring.sql /init/07-cdc-competing.sql; do
           echo "[init-db] Applying $$f"
           psql -v ON_ERROR_STOP=1 -h haproxy -U postgres -d postgres \
             -v sys_writer_password="$$SYS_WRITER_PASSWORD" \
             -v sys_app_password="$$SYS_APP_PASSWORD" \
             -v sys_replication_password="$$SYS_REPLICATION_PASSWORD" \
             -v sys_monitor_password="$$SYS_MONITOR_PASSWORD" \
+            -v sys_drainer_password="$$SYS_DRAINER_PASSWORD" \
             -f "$$f"
         done
         # 03 выполняется на каждой ноде напрямую (реплики недоступны через HAProxy)
@@ -257,6 +259,7 @@ services:
           printf '"sys_writer" "%s"\n' "$$SYS_WRITER_PASSWORD"
           printf '"sys_app" "%s"\n' "$$SYS_APP_PASSWORD"
           printf '"sys_replication" "%s"\n' "$$SYS_REPLICATION_PASSWORD"
+          printf '"sys_drainer" "%s"\n' "$$SYS_DRAINER_PASSWORD"
         } > /pgbouncer-config/userlist.txt
         chmod 644 /pgbouncer-config/userlist.txt
         echo "[init-db] Bootstrap complete."
@@ -486,6 +489,64 @@ services:
       # topic создаётся до старта CDC (сам CDC topic не создаёт, requirements.md 3.2)
       kafka-init: {condition: service_completed_successfully}
 
+  # ---------- CDC Competing (третий подход бенчмарка) ----------
+
+  # Таблица-очередь + конкурирующие потребители: N независимых воркеров в одном
+  # сервисе разбирают public.outbox_messages запросом
+  #   DELETE … WHERE id IN (SELECT id … ORDER BY id FOR UPDATE SKIP LOCKED LIMIT n)
+  #     RETURNING id, topic, body, created_at
+  # от sys_drainer (гранты — 07-cdc-competing.sql), транзакция коммитится ТОЛЬКО
+  # после Kafka delivery пачки → at-least-once (ошибка публикации → ROLLBACK,
+  # строки возвращаются в очередь). Сознательное отклонение от «SELECT-polling
+  # таблицы запрещён» — предмет сравнения бенчмарка (решение владельца).
+  # Работает в паре с Writer writeMode=insertOnly (строки копятся в таблице,
+  # чистит их этот читатель); slot не потребляет. Профиль competing исключает
+  # совместную работу с polling/streaming.
+  # Воркеры/размеры пачек настраиваются через env без правки кода:
+  #   CDC_COMPETING_WORKER_COUNT × CDC_COMPETING_DRAIN_BATCH_SIZE (5×2000 = 10k
+  #   строк в полёте, как потолок пачки polling). Хост-порт 18084 (следующий — 18085).
+  cdc-competing:
+    profiles: ["competing"]
+    build:
+      context: ./src
+      dockerfile: CdcCompeting/Dockerfile
+    image: streaming-polling-outbox/cdc-competing:net8.0
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      CDCCOMPETING__CONNECTION__MODE: ${CDC_COMPETING_CONNECTION_MODE:-pgbouncer}
+      CDCCOMPETING__CONNECTION__PGBOUNCER__HOST: pgbouncer
+      CDCCOMPETING__CONNECTION__PGBOUNCER__PORT: "6432"
+      CDCCOMPETING__CONNECTION__DIRECT__HOST: haproxy
+      CDCCOMPETING__CONNECTION__DIRECT__PORT: "5432"
+      CDCCOMPETING__CONNECTION__DATABASE__NAME: outbox
+      CDCCOMPETING__CONNECTION__DATABASE__USERNAME: sys_drainer
+      CDCCOMPETING__CONNECTION__DATABASE__PASSWORD: ${SYS_DRAINER_PASSWORD:?set in .env}
+      CDCCOMPETING__DRAIN__WORKERCOUNT: ${CDC_COMPETING_WORKER_COUNT:-5}
+      CDCCOMPETING__DRAIN__BATCHSIZE: ${CDC_COMPETING_DRAIN_BATCH_SIZE:-2000}
+      CDCCOMPETING__DRAIN__IDLEINTERVALMS: "500"
+      CDCCOMPETING__KAFKA__BROKERS: kafka1:9092
+      CDCCOMPETING__KAFKA__TOPIC: outbox.events
+      CDCCOMPETING__KAFKA__BATCHSIZE: ${CDC_COMPETING_KAFKA_BATCH_SIZE:-2000}
+      CDCCOMPETING__KAFKA__LINGERMS: ${CDC_KAFKA_LINGER_MS:-0}
+      CDCCOMPETING__KAFKA__MESSAGETIMEOUTMS: "15000"
+    networks: [outbox-net]
+    ports:
+      - "${CDC_COMPETING_HTTP_PORT:-18084}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      haproxy: {condition: service_healthy}
+      pgbouncer: {condition: service_healthy}
+      kafka1: {condition: service_healthy}
+      # topic создаётся до старта CDC (сам CDC topic не создаёт, requirements.md 3.2)
+      kafka-init: {condition: service_completed_successfully}
+
   # ---------- KafkaValidator (этап 7, requirements.md 15) ----------
   # Живой индекс содержимого topic outbox.events: consumer-группа kafka-validator
   # с auto.offset.reset=earliest и БЕЗ сохранения оффсетов — каждый старт читает
@@ -507,6 +568,7 @@ services:
       KAFKAVALIDATOR__WRITER__BASEURL: http://writer:8080
       KAFKAVALIDATOR__CDCPOLLING__BASEURL: http://cdc-polling:8080
       KAFKAVALIDATOR__CDCSTREAMING__BASEURL: http://cdc-streaming:8080
+      KAFKAVALIDATOR__CDCCOMPETING__BASEURL: http://cdc-competing:8080
     networks: [outbox-net]
     ports:
       - "${KAFKA_VALIDATOR_HTTP_PORT:-18083}:8080"

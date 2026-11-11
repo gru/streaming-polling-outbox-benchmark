@@ -11,8 +11,8 @@
 #   per-role CPU/RAM по docker stats (cAdvisor не отдаёт per-container — deviations 7).
 #
 # Использование:
-#   scripts/test/benchmark.sh --cycle all                # A(polling)+wipe+B(streaming)
-#   scripts/test/benchmark.sh --cycle polling|streaming  # один цикл (polling завершится wipe)
+#   scripts/test/benchmark.sh --cycle all                     # A(polling)+wipe+B(streaming)+wipe+C(competing)
+#   scripts/test/benchmark.sh --cycle polling|streaming|competing  # один цикл (polling завершится wipe)
 #   Опции: --skip-wipe   не делать начальный wipe (стенд уже чистый/поднят под этот arm)
 #          --only s1,s3  подмножество сценариев (имена без суффиксов, см. SCENARIOS)
 # Артефакты: results/raw/<stamp>-benchmark-<arm>/{benchmark-report.json, docker-stats.csv,
@@ -33,6 +33,7 @@ WBASE="http://localhost:${WRITER_HTTP_PORT:-18080}"
 VBASE="http://localhost:${KAFKA_VALIDATOR_HTTP_PORT:-18083}"
 PPORT="${CDC_POLLING_HTTP_PORT:-18081}"
 SPORT="${CDC_STREAMING_HTTP_PORT:-18082}"
+CPORT="${CDC_COMPETING_HTTP_PORT:-18084}"
 
 CYCLE_ARG="all"
 SKIP_WIPE=0
@@ -45,8 +46,8 @@ while [[ $# -gt 0 ]]; do
     *) echo "неизвестный аргумент: $1"; exit 1 ;;
   esac
 done
-[[ "$CYCLE_ARG" == all || "$CYCLE_ARG" == polling || "$CYCLE_ARG" == streaming ]] \
-  || { echo "--cycle должен быть all|polling|streaming"; exit 1; }
+[[ "$CYCLE_ARG" == all || "$CYCLE_ARG" == polling || "$CYCLE_ARG" == streaming || "$CYCLE_ARG" == competing ]] \
+  || { echo "--cycle должен быть all|polling|streaming|competing"; exit 1; }
 
 ARM=""; CDC_PORT=""   # ha-common.sh требует их после source
 source scripts/test/ha-common.sh
@@ -72,6 +73,20 @@ SCEN_SPECS=(
   '{"totalMessages":400000,"messageSizeBytes":256,"batchSize":100,"parallelism":8}'
 )
 WARMUP_SPEC='{"totalMessages":500,"ratePerSecond":100,"messageSizeBytes":256,"batchSize":50,"parallelism":4}'
+
+# Спека прогона для текущего arm. Параметры НАГРУЗКИ одинаковы для всех arm (§11);
+# arm competing дополнительно получает writeMode=insertOnly — переключатель пути
+# ДОСТАВКИ, а не нагрузки: Writer оставляет строки в outbox-таблице, их разбирает
+# cdc-competing (DELETE … SKIP LOCKED … RETURNING). Остальные arm идут с дефолтом
+# writeMode=insertDelete (таблица пустая, сообщение живёт в WAL) — поведение
+# существующих циклов не меняется.
+spec_for_arm() { # spec-json → spec-json для текущего ARM
+  if [[ "$ARM" != "competing" ]]; then
+    echo "$1"
+    return 0
+  fi
+  python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d["writeMode"]="insertOnly"; print(json.dumps(d))' "$1"
+}
 
 scenario_enabled() { # short-name без суффикса (s1, s3...)
   [[ -z "$ONLY" ]] && return 0
@@ -128,7 +143,7 @@ wait_run_unique_long() { # runId expected timeout_s → unique на stdout
 # Глобальные выходы: SCEN_JSON (путь), SCEN_RUN_ID, SCEN_WRITTEN.
 run_scenario() { # idx
   local idx=$1 name desc spec run written t0 t1 t2 u code verdict
-  name="${SCEN_NAMES[$idx]}"; desc="${SCEN_DESCS[$idx]}"; spec="${SCEN_SPECS[$idx]}"
+  name="${SCEN_NAMES[$idx]}"; desc="${SCEN_DESCS[$idx]}"; spec="$(spec_for_arm "${SCEN_SPECS[$idx]}")"
   section "Сценарий $name: $desc"
 
   [[ "$(writer_state_field 'state')" != "running" ]] || { bad "$name: Writer ещё занят прошлым прогоном"; return 1; }
@@ -504,11 +519,16 @@ PY
 # ---------- Один цикл (§11) ----------
 run_cycle() { # arm
   ARM=$1
-  if [[ "$ARM" == "polling" ]]; then CDC_PORT=$PPORT; else CDC_PORT=$SPORT; fi
+  case "$ARM" in
+    polling)   CDC_PORT=$PPORT; ARM_LABEL="A" ;;
+    streaming) CDC_PORT=$SPORT; ARM_LABEL="B" ;;
+    competing) CDC_PORT=$CPORT; ARM_LABEL="C" ;;
+    *)         CDC_PORT=$SPORT; ARM_LABEL="?" ;;
+  esac
   CYCLE_STAMP=$(date +%Y-%m-%dT%H:%M:%S)
   CYCLE_DIR="results/raw/$(date +%Y%m%d-%H%M%S)-benchmark-$ARM"
 
-  section "ЦИКЛ $([[ "$ARM" == "polling" ]] && echo A || echo B) (arm=$ARM): чистая инфраструктура (§11)"
+  section "ЦИКЛ $ARM_LABEL (arm=$ARM): чистая инфраструктура (§11)"
   if [[ "$SKIP_WIPE" == "0" ]]; then
     ./scripts/reset/wipe.sh || { bad "wipe не удался"; return 1; }
   else
@@ -522,7 +542,7 @@ run_cycle() { # arm
 
   section "Warmup (не входит в сценарии: JIT, пулы, прогрев валидатора)"
   local wrun wu
-  wrun=$(run_writer "$WARMUP_SPEC")
+  wrun=$(run_writer "$(spec_for_arm "$WARMUP_SPEC")")
   if [[ "$wrun" != FAIL:* ]]; then
     writer_results
     wu=$(wait_run_unique_long "$wrun" "$(writer_field 'd["writtenMessages"]')" 300)
@@ -553,57 +573,58 @@ run_cycle() { # arm
   cycle_report
 }
 
-# ---------- Сводка A vs B (если оба цикла в этом запуске) ----------
-both_summary() {
-  [[ -f results/benchmark/benchmark-polling.json && -f results/benchmark/benchmark-streaming.json ]] \
-    || return 0
+# ---------- Сводка по всем arm (файлы benchmark-<arm>.json, какие есть) ----------
+# Обобщение прежней пары A/B на N arm: polling/streaming/competing. Пишется при
+# наличии минимум двух arm-файлов (как раньше — только после --cycle all).
+arms_summary() {
   python3 <<'PY'
-import json
-a = json.load(open("results/benchmark/benchmark-polling.json"))
-b = json.load(open("results/benchmark/benchmark-streaming.json"))
-out = {"schema": "streaming-polling-outbox/benchmark-summary/v1"}
+import glob, json, os
+files = sorted(glob.glob("results/benchmark/benchmark-*.json"))
+if len(files) < 2:
+    raise SystemExit
+arms = {}
+for path in files:
+    arm = os.path.basename(path)[len("benchmark-"):-len(".json")]
+    arms[arm] = json.load(open(path))
+def pick(s, *path):
+    v = s
+    for k in path:
+        v = (v or {}).get(k)
+    return v
+names = []
+for data in arms.values():
+    for s in data.get("scenarios", []):
+        if s["name"] not in names:
+            names.append(s["name"])
 rows = []
-for sa in a.get("scenarios", []):
-    sb = next((x for x in b.get("scenarios", []) if x["name"] == sa["name"]), None)
-    if not sb:
-        continue
-    def pick(s, *path):
-        v = s
-        for k in path:
-            v = (v or {}).get(k)
-        return v
-    rows.append({
-        "scenario": sa["name"],
-        "polling": {
-            "deliveryTotalMs": pick(sa, "timings", "deliveryTotalMs"),
-            "drainMs": pick(sa, "timings", "drainMs"),
-            "cdcRateOverall": pick(sa, "cdc", "deliveryRateOverallPerSecond"),
-            "cdcRateAvg": pick(sa, "cdc", "deliveryRateAvgPerSecond"),
-            "cdcRatePeak": pick(sa, "cdc", "deliveryRatePeakPerSecond"),
-            "e2eMeanMs": pick(sa, "cdc", "e2eMeanMs"),
-            "e2eP95Ms": pick(sa, "cdc", "e2eP95Ms"),
-            "duplicates": pick(sa, "verdict", "duplicates"),
-        },
-        "streaming": {
-            "deliveryTotalMs": pick(sb, "timings", "deliveryTotalMs"),
-            "drainMs": pick(sb, "timings", "drainMs"),
-            "cdcRateOverall": pick(sb, "cdc", "deliveryRateOverallPerSecond"),
-            "cdcRateAvg": pick(sb, "cdc", "deliveryRateAvgPerSecond"),
-            "cdcRatePeak": pick(sb, "cdc", "deliveryRatePeakPerSecond"),
-            "e2eMeanMs": pick(sb, "cdc", "e2eMeanMs"),
-            "e2eP95Ms": pick(sb, "cdc", "e2eP95Ms"),
-            "duplicates": pick(sb, "verdict", "duplicates"),
-        },
-    })
-out["scenarios"] = rows
+for name in names:
+    row = {"scenario": name}
+    for arm, data in arms.items():
+        s = next((x for x in data.get("scenarios", []) if x["name"] == name), None)
+        if not s:
+            continue
+        row[arm] = {
+            "deliveryTotalMs": pick(s, "timings", "deliveryTotalMs"),
+            "drainMs": pick(s, "timings", "drainMs"),
+            "cdcRateOverall": pick(s, "cdc", "deliveryRateOverallPerSecond"),
+            "cdcRateAvg": pick(s, "cdc", "deliveryRateAvgPerSecond"),
+            "cdcRatePeak": pick(s, "cdc", "deliveryRatePeakPerSecond"),
+            "e2eMeanMs": pick(s, "cdc", "e2eMeanMs"),
+            "e2eP95Ms": pick(s, "cdc", "e2eP95Ms"),
+            "duplicates": pick(s, "verdict", "duplicates"),
+        }
+    rows.append(row)
+out = {"schema": "streaming-polling-outbox/benchmark-summary/v1", "arms": list(arms), "scenarios": rows}
 json.dump(out, open("results/benchmark/summary.json", "w"), ensure_ascii=False, indent=2, sort_keys=True)
-print("  сводка A/B: results/benchmark/summary.json")
+print("  сводка arm'ов (%s): results/benchmark/summary.json" % ", ".join(arms))
 for r in rows:
-    p, s = r["polling"], r["streaming"]
-    print(f"  {r['scenario']:16} drain {str(p['drainMs']):>6}/{str(s['drainMs']):>6}мс"
-          f" | rate avg {str(p['cdcRateAvg']):>7}/{str(s['cdcRateAvg']):>7}"
-          f" | peak {str(p['cdcRatePeak']):>5}/{str(s['cdcRatePeak']):>5} msg/s"
-          f" | e2e p95 {str(p['e2eP95Ms']):>7}/{str(s['e2eP95Ms']):>7}мс")
+    parts = []
+    for arm in arms:
+        m = r.get(arm) or {}
+        parts.append("%s: drain %s / rate avg %s / peak %s msg/s / e2e p95 %s ms" % (
+            arm, str(m.get("drainMs")), str(m.get("cdcRateAvg")),
+            str(m.get("cdcRatePeak")), str(m.get("e2eP95Ms"))))
+    print("  %-16s %s" % (r["scenario"], " | ".join(parts)))
 PY
 }
 
@@ -620,7 +641,11 @@ if [[ "$CYCLE_ARG" == "all" || "$CYCLE_ARG" == "streaming" ]]; then
   [[ "$CYCLE_ARG" == "all" ]] && SKIP_WIPE=0   # только что вытерли — полный путь цикла B
   run_cycle streaming
 fi
+if [[ "$CYCLE_ARG" == "all" || "$CYCLE_ARG" == "competing" ]]; then
+  [[ "$CYCLE_ARG" == "all" ]] && SKIP_WIPE=0   # полный путь цикла C: чистая инфраструктура
+  run_cycle competing
+fi
 
-[[ "$CYCLE_ARG" == "all" ]] && { section "Сводка A/B"; both_summary; }
+[[ "$CYCLE_ARG" == "all" ]] && { section "Сводка всех arm"; arms_summary; }
 
 finish

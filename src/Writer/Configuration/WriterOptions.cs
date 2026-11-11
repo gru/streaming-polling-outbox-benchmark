@@ -50,4 +50,18 @@ public sealed class LoadProfileDefaults
     public int? RatePerSecond { get; set; }
     public int Parallelism { get; set; } = 4;
     public int BatchSize { get; set; } = 100;
+
+    /// <summary>
+    /// Режим записи по умолчанию: insertDelete (строка живёт только внутри
+    /// транзакции — сообщение в WAL, дефолт arm polling/streaming) | insertOnly
+    /// (строки остаются в таблице — их удаляет читатель arm competing).
+    /// </summary>
+    public string WriteMode { get; set; } = WriteModes.InsertDelete;
+}
+
+/// <summary>Допустимые значения writeMode (RunSpec/LoadProfile).</summary>
+public static class WriteModes
+{
+    public const string InsertDelete = "insertDelete";
+    public const string InsertOnly = "insertOnly";
 }

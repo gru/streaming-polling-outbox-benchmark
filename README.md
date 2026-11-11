@@ -1,18 +1,22 @@
-# CDC PostgreSQL → Kafka: SQL Polling vs Streaming Replication (benchmark скорости)
+# CDC PostgreSQL → Kafka: SQL Polling vs Streaming Replication vs Competing Consumers (benchmark скорости)
 
 ## Что хотели сделать изначально
 
-Пример CDC-решения для PostgreSQL с записью через `pg_logical_emit_message()` и чтением двумя способами:
+Пример CDC-решения для PostgreSQL (изначальная идея записи — через `pg_logical_emit_message()`) и benchmark **трёх подходов чтения** outbox → Kafka:
 
 - **Polling** — работа со слотом через SQL-функции PostgreSQL: `pg_logical_slot_peek_changes()` читает изменения порциями, не двигая слот; после обработки позиция подтверждается через `pg_replication_slot_advance()`.
 - **Streaming** — подключение к слоту репликации по протоколу логической репликации через Npgsql (по образцу subscription).
+- **Competing consumers** — таблица-очередь без логического слота: несколько независимых читателей (воркеров) в одном сервисе параллельно и независимо разгребают очередь — `DELETE … WHERE id IN (SELECT id … FOR UPDATE SKIP LOCKED LIMIT n) RETURNING …`; количество воркеров задаётся конфигурацией.
 - **Failover-слоты PostgreSQL 17** — новая возможность версии: logical-слот с `failover=true` синхронизируется на стендбаи и переживает promotion (до PG17 логический слот жил только на primary и терялся при смене лидера — CDC не мог продолжить чтение после failover).
 
 ## Что получилось в итоге
 
-- **Запись — через outbox-таблицу** (`public.outbox_messages`): Writer делает INSERT + DELETE в одной транзакции, таблица всегда пустая, сообщение живёт в WAL. От `pg_logical_emit_message()` отказались: плагин `pgoutput` не передаёт logical messages ни в одной версии PostgreSQL (проверено на 17.2 и 18.4), а `test_decoding`, который их видит, не подходит для production.
+Всё, что задумали, реализовано: три подхода чтения работают на одном стенде, прогоняются одним harness'ом (одинаковые сценарии нагрузки, вердикт независимого валидатора — 0 потерь) и сравниваются построчно в таблице результатов.
+
+- **Запись — через outbox-таблицу** (`public.outbox_messages`): Writer делает INSERT + DELETE в одной транзакции (режим `insertDelete` — дефолт: таблица всегда пустая, сообщение живёт в WAL); для arm competing есть режим `insertOnly` — строки остаются в таблице, их разбирает читатель. От `pg_logical_emit_message()` отказались: плагин `pgoutput` не передаёт logical messages ни в одной версии PostgreSQL (проверено на 17.2 и 18.4), а `test_decoding`, который их видит, не подходит для production.
 - **Чтение Polling** — `pg_logical_slot_peek_binary_changes()` + `pg_replication_slot_advance()` через SECURITY DEFINER-обёртки `cdc.peek_outbox_changes()` / `cdc.advance_outbox_slot()`, вызываются от пользователя `sys_app` **без** атрибута REPLICATION (прямой вызов этих функций требует привилегии REPLICATION, которую прикладному пользователю не даём).
 - **Чтение Streaming** — чтение напрямую из слота репликации через Npgsql (`PgOutputReplicationSlot`, pgoutput) от пользователя `sys_replication` с атрибутом REPLICATION.
+- **Чтение Competing** — как и задумано: N независимых воркеров в одном сервисе (по умолчанию 5 × пачка 2000) забирают пачки `DELETE … FOR UPDATE SKIP LOCKED … RETURNING` от отдельной роли `sys_drainer`, COMMIT только после Kafka delivery пачки (at-least-once), слот не используется вовсе.
 
 ## Результаты прогонов
 
@@ -32,7 +36,7 @@
 
 Один сценарий — две строки (реализации рядом, сравнение построчно). Колонки:
 
-- **Реализация** — вариант CDC: polling (`pg_logical_slot_peek_binary_changes` + `pg_replication_slot_advance`) или streaming (репликация).
+- **Реализация** — вариант CDC: polling (`pg_logical_slot_peek_binary_changes` + `pg_replication_slot_advance`) или streaming (репликация). Competing (третий подход) — числа появятся после первого полного прогона `--cycle competing`.
 - **Скорость (overall)** — средняя скорость доставки по всему окну сценария: доставлено сообщений / (t2 − t0).
 - **Пик** — максимум скорости доставки между соседними сэмплами счётчика доставки CDC (сэмплер опрашивает раз в ~1.5–2 с, т.е. пик усреднён по этому интервалу).
 - **e2e mean / e2e p95** — сквозная латентность одного сообщения: от `created_at` (проставляет Writer в момент создания) до Kafka delivery report (подтверждение записи брокером, acks=all). mean — среднее за сценарий, p95 — 95-й перцентиль.

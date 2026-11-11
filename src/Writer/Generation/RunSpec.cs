@@ -18,6 +18,13 @@ public sealed class RunSpec
     public int? Parallelism { get; set; }
     public int? BatchSize { get; set; }
     public string? ConnectionMode { get; set; }
+
+    /// <summary>
+    /// insertDelete (дефолт: INSERT+DELETE в одной транзакции, таблица пустая,
+    /// сообщение живёт в WAL) | insertOnly (строки остаются в таблице — читает
+    /// их arm competing через DELETE … SKIP LOCKED … RETURNING).
+    /// </summary>
+    public string? WriteMode { get; set; }
 }
 
 /// <summary>
@@ -34,6 +41,9 @@ public sealed record LoadProfile
     public required int? RatePerSecond { get; init; }
     public required int Parallelism { get; init; }
     public required int BatchSize { get; init; }
+
+    /// <summary>insertDelete | insertOnly (см. WriteModes): определяет, удаляет ли Writer строки сам.</summary>
+    public required string WriteMode { get; init; }
     public int? TotalMessages { get; init; }
     public long? TotalPayloadBytes { get; init; }
     public int? DurationSeconds { get; init; }
@@ -47,6 +57,12 @@ public sealed record LoadProfile
     {
         var d = options.Defaults;
         var r = request;
+        var rawWriteMode = (r?.WriteMode ?? d.WriteMode ?? WriteModes.InsertDelete).Trim();
+        var writeMode = string.Equals(rawWriteMode, WriteModes.InsertOnly, StringComparison.OrdinalIgnoreCase)
+            ? WriteModes.InsertOnly
+            : string.Equals(rawWriteMode, WriteModes.InsertDelete, StringComparison.OrdinalIgnoreCase)
+            ? WriteModes.InsertDelete
+            : rawWriteMode; // нестандартное значение — попадёт в ошибку валидации ниже как есть
         var profile = new LoadProfile
         {
             RunId = r?.RunId ?? Guid.NewGuid(),
@@ -55,6 +71,7 @@ public sealed record LoadProfile
             RatePerSecond = r?.RatePerSecond ?? d.RatePerSecond,
             Parallelism = r?.Parallelism ?? d.Parallelism,
             BatchSize = r?.BatchSize ?? d.BatchSize,
+            WriteMode = writeMode,
             TotalMessages = r?.TotalMessages ?? d.TotalMessages,
             TotalPayloadBytes = r?.TotalPayloadBytes ?? d.TotalPayloadBytes,
             DurationSeconds = r?.DurationSeconds ?? d.DurationSeconds,
@@ -63,6 +80,8 @@ public sealed record LoadProfile
 
         if (profile.ConnectionMode is not ("pgbouncer" or "direct"))
             errors.Add($"connectionMode должен быть 'pgbouncer' или 'direct', получено '{profile.ConnectionMode}'");
+        if (profile.WriteMode is not (WriteModes.InsertDelete or WriteModes.InsertOnly))
+            errors.Add($"writeMode должен быть '{WriteModes.InsertDelete}' или '{WriteModes.InsertOnly}', получено '{profile.WriteMode}'");
         if (profile.MessageSizeBytes is < 1 or > 10_000_000)
             errors.Add($"messageSizeBytes должен быть в [1..10000000], получено {profile.MessageSizeBytes}");
         if (profile.Parallelism is < 1 or > 64)

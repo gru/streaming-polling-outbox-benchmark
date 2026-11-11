@@ -39,6 +39,12 @@ scrape_configs:
     static_configs:
       - targets: ['cdc-streaming:8080']
 
+  # CDC Competing (третий подход: таблица-очередь конкурирующими потребителями;
+  # target поднимается вместе с сервисом --profile competing — профили взаимоисключающие)
+  - job_name: cdc-competing
+    static_configs:
+      - targets: ['cdc-competing:8080']
+
   # Валидатор доставки: потребление topic, валидации прогонов, состояние.
   # Детализация по прогонам — через HTTP API валидатора, не через метрики.
   - job_name: kafka-validator

@@ -77,18 +77,23 @@ public sealed class OutboxWriter : IAsyncDisposable
     }
 
     /// <summary>
-    /// Записывает батч одной транзакцией: multi-row INSERT → DELETE тех же строк → commit.
-    /// Таблица остаётся ПУСТОЙ (решение владельца): строка живёт только внутри транзакции,
-    /// сообщение доставляется через WAL — logical decoding эмитит и Insert, и Delete,
-    /// CDC читает изменения через слот и игнорирует Delete-записи.
+    /// Записывает батч одной транзакцией: multi-row INSERT → (holdRows=false) DELETE тех же
+    /// строк → commit. По умолчанию таблица остаётся ПУСТОЙ (решение владельца): строка живёт
+    /// только внутри транзакции, сообщение доставляется через WAL — logical decoding эмитит
+    /// и Insert, и Delete, CDC читает изменения через слот и игнорирует Delete-записи.
+    /// В режиме holdRows=true (writeMode=insertOnly, arm competing) DELETE пропускается:
+    /// строки остаются в таблице, их забирает читатель cdc-competing через
+    /// DELETE … FOR UPDATE SKIP LOCKED … RETURNING.
     /// Транзиентные сбои (failover/switchover, обрывы соединения) ретраятся теми же UUID
     /// с exponential backoff + jitter. Unique violation на ретрае означает, что прошлая
     /// попытка закоммитилась — это и есть разрешение неоднозначного commit (requirements.md 6.3):
-    /// противоречие невозможно, дубликатов в outbox не возникает.
+    /// противоречие невозможно, дубликатов в outbox не возникает (в insertOnly ретрай
+    /// дополнительно защищён персистентными строками: незачищенные успевшим drain'ом
+    /// дубликаты валидатор допускает).
     /// hardCt прерывает попытки немедленно (остановка хоста); stopCt прерывает только
     /// ожидание между ретраями (мягкий stop) — начавшийся commit всегда доигрывается.
     /// </summary>
-    public async Task<BatchResult> WriteBatchAsync(string mode, OutboxMessage[] batch,
+    public async Task<BatchResult> WriteBatchAsync(string mode, bool holdRows, OutboxMessage[] batch,
         CancellationToken hardCt, CancellationToken stopCt)
     {
         var source = SourceFor(mode);
@@ -114,15 +119,20 @@ public sealed class OutboxWriter : IAsyncDisposable
                 }
 
                 // удаляем те же строки в этой же транзакции: таблица не растёт,
-                // DELETE по PK только что вставленных идентификаторов дёшев
-                await using (var delete = new NpgsqlCommand(DeleteSql, conn, tx))
+                // DELETE по PK только что вставленных идентификаторов дёшев.
+                // holdRows (writeMode=insertOnly): DELETE пропускаем — строки
+                // остаются в таблице для arm competing, чистит их читатель.
+                if (!holdRows)
                 {
-                    delete.Parameters.Add(new NpgsqlParameter<Guid[]>
+                    await using (var delete = new NpgsqlCommand(DeleteSql, conn, tx))
                     {
-                        NpgsqlDbType = NpgsqlDbType.Uuid | NpgsqlDbType.Array,
-                        TypedValue = ids,
-                    });
-                    await delete.ExecuteNonQueryAsync(hardCt);
+                        delete.Parameters.Add(new NpgsqlParameter<Guid[]>
+                        {
+                            NpgsqlDbType = NpgsqlDbType.Uuid | NpgsqlDbType.Array,
+                            TypedValue = ids,
+                        });
+                        await delete.ExecuteNonQueryAsync(hardCt);
+                    }
                 }
 
                 var commitSw = System.Diagnostics.Stopwatch.StartNew();
@@ -163,7 +173,7 @@ public sealed class OutboxWriter : IAsyncDisposable
         }
     }
 
-    private const string DeleteSql = "DELETE FROM public.outbox_messages WHERE id = ANY($1)";
+    private const string DeleteSql = "DELETE FROM public.outbox_messages WHERE id = ANY($1)"; // holdRows=false
 
     private static string BuildInsertSql(int rows)
     {

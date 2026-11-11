@@ -1,3 +1,4 @@
+using Writer.Configuration;
 using Writer.Metrics;
 
 namespace Writer.Generation;
@@ -256,7 +257,8 @@ public sealed class GenerationEngine : IHostedService
     {
         try
         {
-            var res = await _db.WriteBatchAsync(ctx.Profile.ConnectionMode, messages, ctx.HardCts.Token, ctx.StopCts.Token);
+            var res = await _db.WriteBatchAsync(ctx.Profile.ConnectionMode,
+                ctx.Profile.WriteMode == WriteModes.InsertOnly, messages, ctx.HardCts.Token, ctx.StopCts.Token);
             var ids = messages.Select(m => m.Id).ToArray();
             var reconnects = Math.Max(0, res.Attempts - 1);
 

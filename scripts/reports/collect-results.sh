@@ -6,7 +6,7 @@
 # scrape не гарантирует сохранение кратковременных событий (13.4).
 #
 # Использование:
-#   scripts/reports/collect-results.sh RUN_ID [--arm auto|polling|streaming]
+#   scripts/reports/collect-results.sh RUN_ID [--arm auto|polling|streaming|competing]
 #                                      [--notes "список отказов"]
 #                                      [--out DIR]
 # Артефакты: results/raw/<timestamp>-<runId>/{result.json,timeseries.csv}
@@ -25,8 +25,9 @@ PROM="http://localhost:9090"
 WBASE="http://localhost:${WRITER_HTTP_PORT:-18080}"
 PPOLL="http://localhost:${CDC_POLLING_HTTP_PORT:-18081}"
 PSTREAM="http://localhost:${CDC_STREAMING_HTTP_PORT:-18082}"
+PCOMP="http://localhost:${CDC_COMPETING_HTTP_PORT:-18084}"
 
-RUN_ID=${1:?usage: collect-results.sh RUN_ID [--arm auto|polling|streaming] [--notes "..."] [--out DIR]}
+RUN_ID=${1:?usage: collect-results.sh RUN_ID [--arm auto|polling|streaming|competing] [--notes "..."] [--out DIR]}
 ARM=auto
 NOTES=""
 OUT_BASE="results/raw"
@@ -60,17 +61,23 @@ fi
 if [[ "$ARM" == "auto" ]]; then
   poll_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 "$PPOLL/api/cdc/state" || true)
   stream_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 "$PSTREAM/api/cdc/state" || true)
-  if [[ "$poll_code" == "200" && "$stream_code" == "200" ]]; then
-    echo "ERROR: отвечают ОБА CDC-сервиса — профили polling/streaming взаимоисключающие (requirements.md 11). Укажите --arm." >&2
+  comp_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 "$PCOMP/api/cdc/state" || true)
+  if [[ "$poll_code" == "200" && "$stream_code" == "200" ]] \
+     || [[ "$poll_code" == "200" && "$comp_code" == "200" ]] \
+     || [[ "$stream_code" == "200" && "$comp_code" == "200" ]]; then
+    echo "ERROR: отвечают НЕСКОЛЬКО CDC-сервисов — профили polling/streaming/competing взаимоисключающие. Укажите --arm." >&2
     exit 2
   elif [[ "$poll_code" == "200" ]]; then ARM=polling
   elif [[ "$stream_code" == "200" ]]; then ARM=streaming
+  elif [[ "$comp_code" == "200" ]]; then ARM=competing
   else
-    echo "ERROR: ни один CDC не отвечает ($PPOLL / $PSTREAM). Запустите профиль и повторите." >&2
+    echo "ERROR: ни один CDC не отвечает ($PPOLL / $PSTREAM / $PCOMP). Запустите профиль и повторите." >&2
     exit 2
   fi
 fi
-CBASE="$PPOLL"; [[ "$ARM" == "streaming" ]] && CBASE="$PSTREAM"
+CBASE="$PPOLL"
+[[ "$ARM" == "streaming" ]] && CBASE="$PSTREAM"
+[[ "$ARM" == "competing" ]] && CBASE="$PCOMP"
 curl -s --max-time 8 "$CBASE/api/cdc/state" -o /tmp/cr-cdc-state.json
 python3 -c "import json; json.load(open('/tmp/cr-cdc-state.json'))" 2>/dev/null || { echo "ERROR: /api/cdc/state недоступен ($CBASE)" >&2; exit 2; }
 echo "== arm: $ARM ($CBASE)"
@@ -275,9 +282,13 @@ series = [  # (колонка CSV, PromQL)
     ("cdc_state", f'cdc_{arm}_state'),
     # Ряды postgres-exporter / kafka-exporter / cAdvisor исключены: эти коллекторы
     # в бенчмарк-стенде не поднимаются (см. docker-compose.yml), метрик не существует.
+    # wal_lag/confirmed_lsn у competing пустые (arm без слота) — колонки остаются,
+    # чтобы схема timeseries.csv была одинаковой для всех arm.
 ]
 if arm == "streaming":
     series.append(("cdc_channel_depth", 'cdc_streaming_channel_depth'))
+if arm == "competing":
+    series.append(("cdc_active_workers", 'cdc_competing_active_workers'))
 
 def query_range(q):
     url = prom + "/api/v1/query_range?" + urllib.parse.urlencode(

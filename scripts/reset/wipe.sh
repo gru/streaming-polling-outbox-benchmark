@@ -6,10 +6,10 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 echo "==> Остановка и удаление контейнеров, сетей и volumes стенда..."
-# ВАЖНО: обе --profile обязаны быть в down. Без них compose останавливает только
-# сервисы БЕЗ профиля — cdc-polling/cdc-streaming (profiles polling/streaming)
-# переживают wipe: контейнер остаётся живым, держит сеть проекта («Resource is
-# still in use») и после нового up reconnect-ится к НОВОМУ кластеру, занимая
-# logical slot (грабли этапа 9).
-docker compose --profile polling --profile streaming down -v --remove-orphans --timeout 30
+# ВАЖНО: все --profile обязаны быть в down. Без них compose останавливает только
+# сервисы БЕЗ профиля — cdc-polling/cdc-streaming/cdc-competing (profiles
+# polling/streaming/competing) переживают wipe: контейнер остаётся живым, держит
+# сеть проекта («Resource is still in use») и после нового up reconnect-ится
+# к НОВОМУ кластеру, занимая logical slot / дорезая outbox-таблицу (грабли этапа 9).
+docker compose --profile polling --profile streaming --profile competing down -v --remove-orphans --timeout 30
 echo "==> Готово. Стенд полностью удалён. Для запуска с нуля: docker compose --profile <arm> up -d --build"
