@@ -102,3 +102,9 @@ bootstrap:
         # Без ограничения удержания WAL в нормальном режиме (requirements.md 12.1;
         # лимит для WAL Pressure Test применяется отдельно).
         max_slot_wal_keep_size: -1
+        # Сравнение arm'ов по нагрузке на postgres: per-statement статистика
+        # (pg_stat_statements). Снапшоты до/после сценария снимает benchmark.sh,
+        # представление создаётся в 06-monitoring.sql. postmaster-параметр:
+        # применяется при bootstrap (wipe → новый кластер), на живом стенде
+        # потребовал бы рестарта всех нод.
+        shared_preload_libraries: pg_stat_statements

@@ -8,7 +8,11 @@
 #   Writer (длительность, фактический rate, p50/p95/p99 commit/batch), CDC (пропускная
 #   способность доставки по сэмплам 1с, e2e p50/p95/p99 + средний e2e по дельтам гистограммы,
 #   счётчики ошибок/ретраев), полный цикл доставки до валидатора (drain), дубликаты,
-#   per-role CPU/RAM по docker stats (cAdvisor не отдаёт per-container — deviations 7).
+#   per-role CPU/RAM по docker stats (cAdvisor не отдаёт per-container — deviations 7),
+#   нагрузка на postgres: дельты снапшотов до/после сценария — pg_stat_statements
+#   (per-statement, включая drain-DELETE competing), pg_stat_user_tables(_indexes),
+#   pg_stat_wal, pg_stat_database, checkpointer/bgwriter; CPU postgres — отдельно
+#   leader и standbys.
 #
 # Использование:
 #   scripts/test/benchmark.sh --cycle all                     # A(polling)+wipe+B(streaming)+wipe+C(competing)
@@ -118,6 +122,55 @@ print("{},{},{}".format(d.get("state", "?"), d.get("messagesDelivered", 0), d.ge
   done
 }
 
+# ---------- Снапшот статистик PostgreSQL (primary через HAProxy) ----------
+# Дельта до/после сценария изолирует нагрузку arm'а на БД от остального стенда:
+#   statements — pg_stat_statements по БД outbox: drain-DELETE у competing vs
+#     INSERT+DELETE Writer'а у polling/streaming vs peek/advance у polling;
+#   table/indexes — pg_stat_user_tables(_indexes) по outbox_messages
+#     (сканирования индексов, dead tuples, autovacuum после mass DELETE);
+#   wal/db/checkpointer/bgwriter — объём WAL, транзакции, буферы, temp files.
+# Одна строка JSON на снапшот; при недоступности psql файл пуст (дельты не считаются).
+pg_snap() { # out_json
+  psql_primary -Atc "
+SELECT json_build_object(
+  'statements', (SELECT coalesce(json_agg(row_to_json(s)), '[]'::json) FROM (
+      SELECT coalesce(queryid::text, ' utility') AS queryid,
+             left(query, 200) AS query, calls,
+             round(total_exec_time::numeric, 1) AS total_exec_ms,
+             round(mean_exec_time::numeric, 3) AS mean_exec_ms, rows,
+             shared_blks_hit, shared_blks_read, shared_blks_dirtied, shared_blks_written,
+             temp_blks_read, temp_blks_written,
+             round(shared_blk_read_time::numeric, 1) AS blk_read_ms,
+             round(shared_blk_write_time::numeric, 1) AS blk_write_ms,
+             wal_records, wal_bytes
+      FROM pg_stat_statements
+      WHERE dbid = (SELECT oid FROM pg_database WHERE datname = 'outbox')
+      ORDER BY total_exec_time DESC LIMIT 500) s),
+  'table', (SELECT coalesce(json_agg(row_to_json(t)), '[]'::json) FROM (
+      SELECT seq_scan, seq_tup_read, idx_scan, n_tup_ins, n_tup_upd, n_tup_del,
+             n_tup_hot_upd, n_live_tup, n_dead_tup, vacuum_count, autovacuum_count,
+             analyze_count, autoanalyze_count
+      FROM pg_stat_user_tables
+      WHERE schemaname = 'public' AND relname = 'outbox_messages') t),
+  'indexes', (SELECT coalesce(json_agg(row_to_json(i)), '[]'::json) FROM (
+      SELECT indexrelname, idx_scan, idx_tup_read, idx_tup_fetch
+      FROM pg_stat_user_indexes
+      WHERE schemaname = 'public' AND relname = 'outbox_messages') i),
+  'wal', (SELECT to_json(w) FROM (SELECT wal_records, wal_fpi, wal_bytes, wal_buffers_full
+      FROM pg_stat_wal) w),
+  'db', (SELECT to_json(d) FROM (SELECT xact_commit, xact_rollback, blks_hit, blks_read,
+      tup_returned, tup_fetched, tup_inserted, tup_updated, tup_deleted,
+      temp_files, temp_bytes, deadlocks
+      FROM pg_stat_database WHERE datname = 'outbox') d),
+  'checkpointer', (SELECT to_json(c) FROM (SELECT num_timed, num_requested,
+      round(write_time::numeric, 0) AS write_time, round(sync_time::numeric, 0) AS sync_time,
+      buffers_written FROM pg_stat_checkpointer) c),
+  'bgwriter', (SELECT to_json(b) FROM (SELECT buffers_clean, maxwritten_clean, buffers_alloc
+      FROM pg_stat_bgwriter) b),
+  'timeline', (SELECT timeline_id FROM pg_control_checkpoint())
+)::text" > "$1" 2>/dev/null || :
+}
+
 # Средний e2e за сценарий по дельтам гистограммы Prometheus (sum/count — счётчики):
 # точный per-сценарный средний e2e, в отличие от rolling-процентилей CDC (окно 4096).
 prom_hist_pair() { # metric_base_without_suffix → "sum count" (или " ")
@@ -151,6 +204,10 @@ run_scenario() { # idx
   curl -s --max-time 10 "http://localhost:$CDC_PORT/api/cdc/state" -o /tmp/bench-cdc-before.json
   local e2e_sum0 e2e_cnt0
   read -r e2e_sum0 e2e_cnt0 <<< "$(prom_hist_pair "cdc_${ARM}_e2e_latency_milliseconds")"
+  # снапшот статистик PG до старта Writer'а + лидер (для разбивки CPU leader/standbys)
+  local pg_leader
+  pg_leader=$(leader_name)
+  pg_snap /tmp/bench-pg-before.json
 
   mkdir -p "$CYCLE_DIR/scenarios" "$CYCLE_DIR/cdc-samples"
   touch /tmp/bench-sampler-on
@@ -181,6 +238,15 @@ run_scenario() { # idx
     || bad "$name: доставлено $u из $written за 900с"
 
   curl -s --max-time 10 "http://localhost:$CDC_PORT/api/cdc/state" -o /tmp/bench-cdc-after.json
+  # pending-статистики postgres (table/db/wal) бэкенды флашат с задержкой:
+  # непрерывно работающие (drain-воркеры) — за ~1-3с, idle-подключения Writer'а —
+  # замерено на стенде ~9с после завершения прогона. Без паузы after-снапшот
+  # теряет Writer-хвост (ins/wal/xact). 15с покрывает худший случай; pg_stat_statements
+  # обновляется сразу и паузой не искажается. Побочный эффект: в дельту competing
+  # попадают пустые poll-вызовы drain-воркеров за паузу — это реальная стоимость
+  # steady-state поллинга пустой очереди, оставляем.
+  sleep 15
+  pg_snap /tmp/bench-pg-after.json
   code=$(validate_run "$run" true)
   if [[ "$code" == "200" ]]; then
     assert_verdict_pass_dup "$name"
@@ -207,6 +273,7 @@ run_scenario() { # idx
   SCEN_T0="$t0" SCEN_T1="$t1" SCEN_T2="$t2" \
   E2E_SUM0="$e2e_sum0" E2E_CNT0="$e2e_cnt0" E2E_SUM1="$e2e_sum1" E2E_CNT1="$e2e_cnt1" \
   CDC_BEFORE="/tmp/bench-cdc-before.json" CDC_AFTER="/tmp/bench-cdc-after.json" \
+  PG_BEFORE="/tmp/bench-pg-before.json" PG_AFTER="/tmp/bench-pg-after.json" PG_LEADER="$pg_leader" \
   WRITER_JSON="/tmp/bench-writer.json" VERDICT_JSON="/tmp/ha-verdict.json" \
   SAMPLES_TSV="$CYCLE_DIR/cdc-samples/$name.tsv" DOCKER_STATS_CSV="$DOCKER_STATS_CSV" \
   SCEN_OUT="$SCEN_JSON" BENCH_ARM="$ARM" python3 <<'PY'
@@ -282,6 +349,86 @@ try:
 except Exception:
     pass
 
+# дельты статистик postgres: снапшоты pg_snap до/после сценария (нагрузка arm'а на БД)
+def pg_load(path):
+    try:
+        txt = open(path).read().strip()
+        return json.loads(txt) if txt else None
+    except Exception:
+        return None
+
+pg_before = pg_load(os.environ.get("PG_BEFORE", ""))
+pg_after = pg_load(os.environ.get("PG_AFTER", ""))
+scen["postgres"] = {"leader": os.environ.get("PG_LEADER") or None,
+                    "snapshots": bool(pg_before and pg_after)}
+if pg_before and pg_after:
+    # статистики не реплицируются: failover между снапшотами делает дельты
+    # мусором — детектим по смене timeline (pg_control_checkpoint)
+    if pg_before.get("timeline") != pg_after.get("timeline"):
+        scen["postgres"]["snapshots"] = False
+        scen["postgres"]["snapshotWarning"] = (
+            f"failover между снапшотами (timeline {pg_before.get('timeline')}"
+            f" -> {pg_after.get('timeline')}): дельты postgres не считаются")
+    def fnum(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    # statements: кумулятивные счётчики → дельта по queryid
+    STMT_F = ("calls", "total_exec_ms", "rows", "shared_blks_hit", "shared_blks_read",
+              "shared_blks_dirtied", "shared_blks_written", "temp_blks_read", "temp_blks_written",
+              "blk_read_ms", "blk_write_ms", "wal_records", "wal_bytes")
+    bmap = {s["queryid"]: s for s in pg_before.get("statements") or []}
+    stmts = []
+    for a in pg_after.get("statements") or []:
+        b = bmap.get(a["queryid"], {})
+        d = {"queryid": a["queryid"], "query": a["query"]}
+        for k in STMT_F:
+            d["d_" + k] = round(fnum(a.get(k)) - fnum(b.get(k)), 3)
+        if any(d["d_" + k] for k in STMT_F):
+            stmts.append(d)
+    # собственные снапшот-запросы — не нагрузка сценария
+    stmts = [s for s in stmts if "pg_stat_statements" not in s["query"]
+             and "json_build_object" not in s["query"]]
+    for s in stmts:
+        s["mean_exec_ms"] = round(s["d_total_exec_ms"] / s["d_calls"], 3) if s["d_calls"] else None
+        q = s["query"].lstrip()
+        if q.startswith("DELETE"):
+            s["role"] = "drain-delete" if "outbox_messages" in q else "delete"
+        elif q.startswith("INSERT"):
+            s["role"] = "writer-insert" if "outbox_messages" in q else "insert"
+        elif "outbox_messages" in q:
+            s["role"] = "outbox-other"
+        else:
+            s["role"] = "other"
+    stmts.sort(key=lambda s: -s["d_total_exec_ms"])
+    scen["postgres"]["statements"] = stmts
+
+    # таблица: счётчики — дельта; n_live_tup/n_dead_tup — гейджи, значение ПОСЛЕ
+    bt = (pg_before.get("table") or [{}])[0]
+    at = (pg_after.get("table") or [{}])[0]
+    tdel, tafter = {}, {}
+    for k, v in at.items():
+        if k in ("n_live_tup", "n_dead_tup"):
+            tafter[k] = v
+        else:
+            tdel["d_" + k] = round(fnum(v) - fnum(bt.get(k)), 3)
+    scen["postgres"]["table"] = {"delta": tdel, "after": tafter}
+
+    bix = {i["indexrelname"]: i for i in pg_before.get("indexes") or []}
+    scen["postgres"]["indexes"] = [
+        {"indexrelname": i["indexrelname"],
+         **{"d_" + k: round(fnum(i.get(k)) - fnum(bix.get(i["indexrelname"], {}).get(k)), 3)
+            for k in ("idx_scan", "idx_tup_read", "idx_tup_fetch")}}
+        for i in pg_after.get("indexes") or []]
+
+    # wal / db / checkpointer / bgwriter — счётчики, дельта
+    for section in ("wal", "db", "checkpointer", "bgwriter"):
+        b, a = pg_before.get(section) or {}, pg_after.get(section) or {}
+        scen["postgres"][section] = {"d_" + k: round(fnum(a.get(k)) - fnum(b.get(k)), 3)
+                                     for k in a}
+
 # сэмплы доставки: скорость = рост delivered. Каденс сэмплера ~1.5-2с (curl+python),
 # поэтому peak — максимум СКОРОСТИ МЕЖДУ СОСЕДНИМИ сэмплами (нормировано к 1с),
 # avg — активное окно (первый→последний рост); при <2 ростов (burst короче каденса)
@@ -318,7 +465,7 @@ except Exception:
 # per-role CPU/RAM из docker stats (срез 5с по всему циклу → окно сценария).
 # Burst-сценарии короче интервала сэмплера → окно расширяется до >=12с
 # (паддинг фиксируется в resourceWindowMs; cpuAvg за паддинг занижен, cpuMax честен).
-def role_stats(prefixes):
+def stats_for(container_pred):
     pad_b, pad_a = 2000, 2000
     span = t2 - t0
     if span < 12000:
@@ -339,7 +486,7 @@ def role_stats(prefixes):
                     continue
                 if not (lo <= ts <= hi):
                     continue
-                if not any(r["container"].startswith(p) for p in prefixes):
+                if not container_pred(r["container"]):
                     continue
                 b = buckets.setdefault(int(ts // 5000), {"cpu": 0.0, "mem": 0})
                 try:
@@ -362,10 +509,21 @@ def role_stats(prefixes):
         "resourceWindowMs": hi - lo,
     }
 
+def role_stats(prefixes):
+    return stats_for(lambda c: any(c.startswith(p) for p in prefixes))
+
 proj = "streaming-polling-outbox"
+pg_nodes = [f"{proj}-pg{i}-1" for i in (1, 2, 3)]
+leader_node = os.environ.get("PG_LEADER") or ""
+leader_ctr = f"{proj}-{leader_node}-1"
+pg_leader_stats = stats_for(lambda c: c == leader_ctr) if leader_ctr in pg_nodes else None
+if pg_leader_stats is not None:
+    pg_leader_stats = {"node": leader_node, **pg_leader_stats}
 scen["resources"] = {
     "cdc": role_stats([f"{proj}-cdc-"]),
-    "postgresql": role_stats([f"{proj}-pg1", f"{proj}-pg2", f"{proj}-pg3"]),
+    "postgresql": role_stats(pg_nodes),  # сумма 3 нод (как раньше — совместимость)
+    "pgLeader": pg_leader_stats,
+    "pgStandbys": stats_for(lambda c: c in pg_nodes and c != leader_ctr),
     "kafka": role_stats([f"{proj}-kafka1"]),
 }
 
@@ -377,6 +535,16 @@ print(f"    → writer {scen['writer']['writerRatePerSecond']} msg/s"
       f" | cdc avg {c.get('deliveryRateAvgPerSecond','?')} пик {c.get('deliveryRatePeakPerSecond','?')} msg/s"
       f" | e2e p50/p95/p99 {c.get('e2eP50Ms','?')}/{c.get('e2eP95Ms','?')}/{c.get('e2eP99Ms','?')}мс"
       f" | дубликатов {v['duplicates']}")
+pg = scen.get("postgres") or {}
+if pg.get("snapshots"):
+    lead = (scen.get("resources") or {}).get("pgLeader") or {}
+    wal_mb = round((pg.get("wal") or {}).get("d_wal_bytes", 0) / 1e6, 1)
+    drain = next((s for s in pg.get("statements") or []
+                  if s.get("role") == "drain-delete" and s.get("mean_exec_ms") is not None), None)
+    drain_txt = f" | drain-delete mean {drain['mean_exec_ms']}мс/батч x{int(drain['d_calls'])}" if drain else ""
+    print(f"    → pg: leader cpu avg {lead.get('cpuAvgPercent','?')}% max {lead.get('cpuMaxPercent','?')}%"
+          f" | xact {round((pg.get('db') or {}).get('d_xact_commit', 0))}"
+          f" | wal {wal_mb}МБ | tup del {round((pg.get('db') or {}).get('d_tup_deleted', 0))}{drain_txt}")
 PY
   [[ $? -eq 0 && -f "$SCEN_JSON" ]] && ok "$name: сводка: $SCEN_JSON" || bad "$name: сводка не собрана"
 }
@@ -441,7 +609,7 @@ if runs:
 
 # ресурсы за весь блок сценариев [первый t0 .. последний t2]: честное сравнение
 # CPU/RAM между реализациями на ОДИНАКОВОЙ работе (per-сценарные окна коротки для 5с-сэмплера)
-def cycle_role_resources(prefixes, lo, hi):
+def cycle_stats_for(container_pred, lo, hi):
     from datetime import datetime
     sums, mems = [], []
     try:
@@ -455,7 +623,7 @@ def cycle_role_resources(prefixes, lo, hi):
                     continue
                 if not (lo <= ts <= hi):
                     continue
-                if not any(r["container"].startswith(p) for p in prefixes):
+                if not container_pred(r["container"]):
                     continue
                 b = buckets.setdefault(int(ts // 5000), {"cpu": 0.0, "mem": 0})
                 try:
@@ -474,15 +642,65 @@ def cycle_role_resources(prefixes, lo, hi):
             "memAvgBytes": round(sum(mems) / len(mems)),
             "memMaxBytes": max(mems), "slices": len(sums)}
 
+def cycle_role_resources(prefixes, lo, hi):
+    return cycle_stats_for(lambda c: any(c.startswith(p) for p in prefixes), lo, hi)
+
+# слияние postgres-дельт сценариев цикла: statements суммируются по queryid,
+# счётчики wal/db/... — суммой; гейджи таблицы (n_*_tup) — после последнего сценария
+def merge_pg(scens):
+    out = {"statements": {}, "table": {}, "wal": {}, "db": {}, "checkpointer": {}, "bgwriter": {}}
+    for s in scens:
+        pg = s.get("postgres") or {}
+        if not pg.get("snapshots"):
+            continue
+        for st in pg.get("statements") or []:
+            m = out["statements"].setdefault(
+                st["queryid"], {"queryid": st["queryid"], "query": st["query"], "role": st.get("role")})
+            for k, v in st.items():
+                if k.startswith("d_"):
+                    m[k] = round(m.get(k, 0) + v, 3)
+        for sec in ("wal", "db", "checkpointer", "bgwriter"):
+            for k, v in (pg.get(sec) or {}).items():
+                if k.startswith("d_"):
+                    out[sec][k] = round(out[sec].get(k, 0) + v, 3)
+        t = pg.get("table") or {}
+        for k, v in (t.get("delta") or {}).items():
+            out["table"][k] = round(out["table"].get(k, 0) + v, 3)
+        if t.get("after"):
+            out["table"]["after"] = t["after"]  # гейджи: значение после последнего сценария
+    stmts = sorted(out["statements"].values(), key=lambda s: -s.get("d_total_exec_ms", 0))
+    for s in stmts:
+        s["mean_exec_ms"] = round(s["d_total_exec_ms"] / s["d_calls"], 3) if s.get("d_calls") else None
+    out["statements"] = stmts
+    return out
+
 t0s = [s["timings"]["t0EpochMs"] for s in scens if s.get("timings", {}).get("t0EpochMs")]
 t2s = [s["timings"]["t2EpochMs"] for s in scens if s.get("timings", {}).get("t2EpochMs")]
 resources = {}
 if t0s and t2s:
     proj = "streaming-polling-outbox"
+    pg_nodes = [f"{proj}-pg{i}-1" for i in (1, 2, 3)]
+    # лидер цикла: самый частый среди снятых в сценариях (failover внутри цикла
+    # сломал бы вердикты — не ожидается; при расхождении видно по per-scenario)
+    leaders = [s.get("postgres", {}).get("leader") for s in scens
+               if s.get("postgres", {}).get("leader")]
+    leader_node = max(set(leaders), key=leaders.count) if leaders else ""
+    leader_ctr = f"{proj}-{leader_node}-1"
+    # при коротком цикле (единственный burst-сценарий) окно [t0..t2] может не
+    # contain ни одного 5с-среза docker stats → цикловые pg-ресурсы None
+    # (per-scenario окна с паддингом остаются источником)
+    pg_leader_cycle = None
+    if leader_ctr in pg_nodes:
+        st = cycle_stats_for(lambda c: c == leader_ctr, min(t0s), max(t2s))
+        if st is not None:
+            pg_leader_cycle = {"node": leader_node, **st}
     resources = {
         "window": {"fromMs": min(t0s), "toMs": max(t2s)},
         "cdc": cycle_role_resources([f"{proj}-cdc-"], min(t0s), max(t2s)),
-        "postgresql": cycle_role_resources([f"{proj}-pg1", f"{proj}-pg2", f"{proj}-pg3"], min(t0s), max(t2s)),
+        "postgresql": cycle_role_resources(pg_nodes, min(t0s), max(t2s)),
+        "pgLeader": pg_leader_cycle,
+        "pgStandbys": cycle_stats_for(lambda c: c in pg_nodes and c != leader_ctr,
+                                      min(t0s), max(t2s)),
         "kafka": cycle_role_resources([f"{proj}-kafka1"], min(t0s), max(t2s)),
         "writer": cycle_role_resources([f"{proj}-writer-"], min(t0s), max(t2s)),
     }
@@ -495,6 +713,7 @@ report = {
     "git": git,
     "versions": vers,
     "resources": resources,
+    "postgres": merge_pg(scens),
     "scenarios": scens,
     "totals": {
         "scenarios": len(scens),
@@ -513,6 +732,18 @@ t = report["totals"]
 print(f"  сценариев {t['scenarios']}, pass {t['verdictsPass']}/{t['scenarios']}, "
       f"доставлено {t['messagesDelivered']}, дубликатов {t['duplicatesTotal']}, "
       f"readErrors {t['readErrors']}, kafkaErrors {t['kafkaErrors']}")
+pgm = report.get("postgres") or {}
+if pgm.get("statements"):
+    lead = (resources.get("pgLeader") or {})
+    print(f"  postgres: leader {lead.get('node','?')} cpu avg {lead.get('cpuAvgPercent','?')}%"
+          f" | standbys cpu avg {(resources.get('pgStandbys') or {}).get('cpuAvgPercent','?')}%"
+          f" | wal {round(pgm.get('wal', {}).get('d_wal_bytes', 0) / 1e6, 1)}МБ"
+          f" | xact {round(pgm.get('db', {}).get('d_xact_commit', 0))}")
+    for s in pgm["statements"][:5]:
+        print(f"    {s.get('role','?'):>14}  mean {s.get('mean_exec_ms')}мс  calls {int(s.get('d_calls', 0))}"
+              f"  wal {round(s.get('d_wal_bytes', 0) / 1e6, 2)}МБ  blks r/w "
+              f"{int(s.get('d_shared_blks_read', 0))}/{int(s.get('d_shared_blks_dirtied', 0))}"
+              f"  | {s['query'][:100]}")
 PY
 }
 
@@ -612,6 +843,13 @@ for name in names:
             "e2eMeanMs": pick(s, "cdc", "e2eMeanMs"),
             "e2eP95Ms": pick(s, "cdc", "e2eP95Ms"),
             "duplicates": pick(s, "verdict", "duplicates"),
+            "pgLeaderCpuAvgPercent": pick(s, "resources", "pgLeader", "cpuAvgPercent"),
+            "pgStandbysCpuAvgPercent": pick(s, "resources", "pgStandbys", "cpuAvgPercent"),
+            "pgWalMb": round((pick(s, "postgres", "wal", "d_wal_bytes") or 0) / 1e6, 1),
+            "pgXactCommit": pick(s, "postgres", "db", "d_xact_commit"),
+            "drainDeleteMeanMs": next(
+                (st.get("mean_exec_ms") for st in (pick(s, "postgres", "statements") or [])
+                 if st.get("role") == "drain-delete"), None),
         }
     rows.append(row)
 out = {"schema": "streaming-polling-outbox/benchmark-summary/v1", "arms": list(arms), "scenarios": rows}
@@ -625,6 +863,13 @@ for r in rows:
             arm, str(m.get("drainMs")), str(m.get("cdcRateAvg")),
             str(m.get("cdcRatePeak")), str(m.get("e2eP95Ms"))))
     print("  %-16s %s" % (r["scenario"], " | ".join(parts)))
+    pgparts = []
+    for arm in arms:
+        m = r.get(arm) or {}
+        pgparts.append("%s: pg leader cpu %s%% / wal %sМБ / xact %s" % (
+            arm, str(m.get("pgLeaderCpuAvgPercent")), str(m.get("pgWalMb")),
+            str(m.get("pgXactCommit") and round(m.get("pgXactCommit")))))
+    print("  %-16s %s" % ("", " | ".join(pgparts)))
 PY
 }
 

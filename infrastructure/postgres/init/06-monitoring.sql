@@ -32,3 +32,11 @@ GRANT pg_monitor TO sys_monitor WITH INHERIT TRUE;
 \connect outbox
 
 GRANT CONNECT ON DATABASE outbox TO sys_monitor;
+
+-- pg_stat_statements: per-statement статистика нагрузки на postgres для
+-- сравнения arm'ов бенчмарка (drain-DELETE у competing vs INSERT+DELETE Writer'а
+-- у polling/streaming vs peek-функции у polling). Библиотека прелоадится
+-- cluster-wide через shared_preload_libraries (patroni.yml, DCS-параметры);
+-- здесь создаётся представление в прикладной БД. Смотреть будет только postgres
+-- (снапшоты benchmark.sh) — прикладным ролям грантов на него не даём.
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
