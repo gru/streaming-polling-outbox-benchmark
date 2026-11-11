@@ -62,6 +62,15 @@
 
 Дополнительно (окно всех сценариев): память CDC max ~2.27 ГБ (polling) / ~2.95 ГБ (streaming) / ~0.45 ГБ (competing), CPU CDC avg 22.9% / 12.7% / 9.3%. В s5 (окно дрейна): CPU лидера postgres polling 96% / streaming 124% / competing 228%, WAL за сценарий 3.05 / 3.09 / 4.83 ГБ — competing дороже: drain удаляет строки отдельными транзакциями ПОСЛЕ записи (грязные heap-страницы успевают получить новые full-page images между вставкой и удалением), у слотовых arm'ов INSERT+DELETE идут одной транзакцией Writer'а.
 
+### Выводы по s5 (что показала смена методики)
+
+До смены методики s5 гонялся concurrent (400k, Writer и CDC работали одновременно) — сравнение со старыми числами:
+
+- **Короткое окно завышало «устойчивую» скорость**: на 400k-прогоне competing avg 74.4k / streaming 63.4k / polling 24.7k; на длинном pure-drain 4M — 44.1k / 100.9k / 24.5k. У competing avg упал в 1.7 раза (burst-фаза маскировала деградацию на длинной очереди), у streaming — вырос в 1.6 раза.
+- **Polling недооценивали по пику**: 39.1k на concurrent-прогоне против 65.8k на pure-drain — без конкуренции Writer'а за лидера peek/advance разгоняется вдвое.
+- **Streaming — единственный, кто держит скорость на длинном окне** (100.9k avg в течение 40 с, пик 164k): на коротком окне он выглядел «примерно равным» competing (63k против 74k), на длинном — быстрее в 2.3 раза.
+- **Ресурсный профиль при backlog-дрейне**: competing переносит нагрузку в postgres (CPU лидера 228%, память CDC всего 0.45 ГБ), слотовые arm'ы — в собственный процесс декодирования (CPU CDC max 548–601%, память 2.3–3.0 ГБ; CPU лидера 96–124%).
+
 ## Замечание: непотребляемый logical-слот не переживает failover
 
 Документированное поведение PostgreSQL 17 ([§47.2.3 «Replication Slot Synchronization»](https://www.postgresql.org/docs/17/logicaldecoding-explanation.html#LOGICALDECODING-REPLICATION-SLOTS-SYNCHRONIZATION)), не баг.
