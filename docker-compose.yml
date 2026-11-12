@@ -501,8 +501,9 @@ services:
   # чистит их этот читатель); slot не потребляет. Профиль competing исключает
   # совместную работу с polling/streaming.
   # Воркеры/размеры пачек настраиваются через env без правки кода:
-  #   CDC_COMPETING_WORKER_COUNT × CDC_COMPETING_DRAIN_BATCH_SIZE (5×2000 = 10k
-  #   строк в полёте, как потолок пачки polling). Хост-порт 18084 (следующий — 18085).
+  #   CDC_COMPETING_WORKER_COUNT × CDC_COMPETING_DRAIN_BATCH_SIZE (tuned-дефолт
+  #   10×10000 = 100k строк в полёте; цели прогона — README «Целевые показатели
+  #   competing», история: 5×2000 до 2026-11-12). Хост-порт 18084 (следующий — 18085).
   cdc-competing:
     profiles: ["competing"]
     build:
@@ -519,12 +520,12 @@ services:
       CDCCOMPETING__CONNECTION__DATABASE__NAME: outbox
       CDCCOMPETING__CONNECTION__DATABASE__USERNAME: sys_drainer
       CDCCOMPETING__CONNECTION__DATABASE__PASSWORD: ${SYS_DRAINER_PASSWORD:?set in .env}
-      CDCCOMPETING__DRAIN__WORKERCOUNT: ${CDC_COMPETING_WORKER_COUNT:-5}
-      CDCCOMPETING__DRAIN__BATCHSIZE: ${CDC_COMPETING_DRAIN_BATCH_SIZE:-2000}
+      CDCCOMPETING__DRAIN__WORKERCOUNT: ${CDC_COMPETING_WORKER_COUNT:-10}
+      CDCCOMPETING__DRAIN__BATCHSIZE: ${CDC_COMPETING_DRAIN_BATCH_SIZE:-10000}
       CDCCOMPETING__DRAIN__IDLEINTERVALMS: "500"
       CDCCOMPETING__KAFKA__BROKERS: kafka1:9092
       CDCCOMPETING__KAFKA__TOPIC: outbox.events
-      CDCCOMPETING__KAFKA__BATCHSIZE: ${CDC_COMPETING_KAFKA_BATCH_SIZE:-2000}
+      CDCCOMPETING__KAFKA__BATCHSIZE: ${CDC_COMPETING_KAFKA_BATCH_SIZE:-10000}
       CDCCOMPETING__KAFKA__LINGERMS: ${CDC_KAFKA_LINGER_MS:-0}
       CDCCOMPETING__KAFKA__MESSAGETIMEOUTMS: "15000"
     networks: [outbox-net]
