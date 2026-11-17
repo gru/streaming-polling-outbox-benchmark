@@ -116,6 +116,7 @@ services:
       PATRONI_POSTGRESQL_AUTHENTICATION_REPLICATION_USERNAME: postgres
       PATRONI_POSTGRESQL_AUTHENTICATION_REPLICATION_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     networks: [outbox-net]
+    shm_size: 256m
     volumes:
       - pg1_data:/var/lib/postgresql/data
     ports:
@@ -142,6 +143,7 @@ services:
       PATRONI_RESTAPI_CONNECT_ADDRESS: pg2:8008
       PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg2:5432
     networks: [outbox-net]
+    shm_size: 256m
     volumes:
       - pg2_data:/var/lib/postgresql/data
     ports:
@@ -168,6 +170,7 @@ services:
       PATRONI_RESTAPI_CONNECT_ADDRESS: pg3:8008
       PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg3:5432
     networks: [outbox-net]
+    shm_size: 256m
     volumes:
       - pg3_data:/var/lib/postgresql/data
     ports:
