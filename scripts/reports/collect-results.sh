@@ -94,7 +94,7 @@ $DC exec -T -e PGPASSWORD="$POSTGRES_PASSWORD" pg1 psql -h haproxy -U postgres -
 # --- Kafka: фактические записи прогона по runId --------------------------------
 echo "== читаю Kafka (outbox.events, --from-beginning; фильтр body.runId=$RUN_ID)..."
 $DC exec -T kafka1 /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 --topic outbox.events --from-beginning --timeout-ms 15000 \
+  --bootstrap-server localhost:9092 --topic outbox.events --from-beginning --timeout-ms "${COLLECT_KAFKA_TIMEOUT_MS:-15000}" \
   > /tmp/cr-kafka.jsonl 2>/dev/null
 
 # --- версии компонентов ---------------------------------------------------------
