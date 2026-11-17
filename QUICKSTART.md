@@ -14,7 +14,7 @@
 | **writer** `:18080` | Генератор нагрузки. Режим `writeMode=insertDelete` (дефолт): INSERT+DELETE одной транзакцией — таблица всегда пустая, сообщение живёт в WAL. Режим `writeMode=insertOnly` (для arm competing): строки копятся в таблице, чистит их читатель |
 | **cdc-polling** (profile `polling`) `:18081` | Реализация A: чтение слота SQL-функциями `pg_logical_slot_peek_binary_changes` + `pg_replication_slot_advance` |
 | **cdc-streaming** (profile `streaming`) `:18082` | Реализация B: чтение слота протоколом логической репликации (Npgsql) |
-| **cdc-competing** (profile `competing`) `:18084` | Реализация C: таблица-очередь конкурирующими потребителями — N воркеров (по умолчанию 10×10000, tuned-конфиг с 2026-11-12, свип подтвердил (10×5000 в пределах шума — README «Выводы»)) разбирают таблицу `DELETE … FOR UPDATE SKIP LOCKED … RETURNING` в транзакции поверх публикации в Kafka (at-least-once); роль `sys_drainer`, слот не использует |
+| **cdc-competing** (profile `competing`) `:18084` | Реализация C: таблица-очередь конкурирующими потребителями — N воркеров (по умолчанию 10×10000; свип: 10×5000 в пределах шума — README «Выводы») разбирают таблицу `DELETE … FOR UPDATE SKIP LOCKED … RETURNING` в транзакции поверх публикации в Kafka (at-least-once); роль `sys_drainer`, слот не использует |
 | **kafka-validator** `:18083` | Независимый консюмер: вердикт доставки (0 потерь / 0 дубликатов), фиксирует момент полного дрейна прогона |
 | **prometheus** `:9090` | Метрики участников; источник e2e-гистограмм для benchmark |
 | **init-db, kafka-init** | One-shot инициализаторы (роли, БД, publication, слот, peek/advance-функции; создание топика) |

@@ -501,9 +501,9 @@ services:
   # чистит их этот читатель); slot не потребляет. Профиль competing исключает
   # совместную работу с polling/streaming.
   # Воркеры/размеры пачек настраиваются через env без правки кода:
-  #   CDC_COMPETING_WORKER_COUNT × CDC_COMPETING_DRAIN_BATCH_SIZE (tuned-дефолт
-  #   10×10000 = 100k строк в полёте; свип 2026-11-17 подтвердил дефолт, 10×5000
-  #   в пределах шума — README «Выводы»). Хост-порт 18084 (следующий — 18085).
+  #   CDC_COMPETING_WORKER_COUNT × CDC_COMPETING_DRAIN_BATCH_SIZE (дефолт
+  #   10×10000 = 100k строк в полёте; свип: 10×5000 в пределах шума — README
+  #   «Выводы»). Хост-порт 18084 (следующий — 18085).
   cdc-competing:
     profiles: ["competing"]
     build:
