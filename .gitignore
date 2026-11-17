@@ -12,3 +12,6 @@
 
 # Полные артефакты прогонов (results/raw/<stamp>-*) — не для коммита
 results/raw/
+
+# Логи и state конфигурационных серий bench-runner (сырые артефакты, как results/raw)
+bench-runner/logs/
