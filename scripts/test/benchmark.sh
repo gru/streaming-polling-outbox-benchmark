@@ -38,6 +38,7 @@ VBASE="http://localhost:${KAFKA_VALIDATOR_HTTP_PORT:-18083}"
 PPORT="${CDC_POLLING_HTTP_PORT:-18081}"
 SPORT="${CDC_STREAMING_HTTP_PORT:-18082}"
 CPORT="${CDC_COMPETING_HTTP_PORT:-18084}"
+WV6PORT="${CDC_WALV6_HTTP_PORT:-18086}"
 
 CYCLE_ARG="all"
 SKIP_WIPE=0
@@ -50,8 +51,8 @@ while [[ $# -gt 0 ]]; do
     *) echo "неизвестный аргумент: $1"; exit 1 ;;
   esac
 done
-[[ "$CYCLE_ARG" == all || "$CYCLE_ARG" == polling || "$CYCLE_ARG" == streaming || "$CYCLE_ARG" == competing ]] \
-  || { echo "--cycle должен быть all|polling|streaming|competing"; exit 1; }
+[[ "$CYCLE_ARG" == all || "$CYCLE_ARG" == polling || "$CYCLE_ARG" == streaming || "$CYCLE_ARG" == competing || "$CYCLE_ARG" == walv6 ]] \
+  || { echo "--cycle должен быть all|polling|streaming|competing|walv6"; exit 1; }
 
 ARM=""; CDC_PORT=""   # ha-common.sh требует их после source
 source scripts/test/ha-common.sh
@@ -81,15 +82,19 @@ WARMUP_SPEC='{"totalMessages":500,"ratePerSecond":100,"messageSizeBytes":256,"ba
 # Спека прогона для текущего arm. Параметры НАГРУЗКИ одинаковы для всех arm (§11);
 # arm competing дополнительно получает writeMode=insertOnly — переключатель пути
 # ДОСТАВКИ, а не нагрузки: Writer оставляет строки в outbox-таблице, их разбирает
-# cdc-competing (DELETE … SKIP LOCKED … RETURNING). Остальные arm идут с дефолтом
-# writeMode=insertDelete (таблица пустая, сообщение живёт в WAL) — поведение
-# существующих циклов не меняется.
+# cdc-competing (DELETE … SKIP LOCKED … RETURNING). arm walv6 получает writeMode=walEmit
+# (безтабличная пакетная запись в WAL через pg_logical_emit_message). Остальные arm
+# идут с дефолтом writeMode=insertDelete (таблица пустая, сообщение живёт в WAL).
 spec_for_arm() { # spec-json → spec-json для текущего ARM
-  if [[ "$ARM" != "competing" ]]; then
-    echo "$1"
+  if [[ "$ARM" == "competing" ]]; then
+    python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d["writeMode"]="insertOnly"; print(json.dumps(d))' "$1"
     return 0
   fi
-  python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d["writeMode"]="insertOnly"; print(json.dumps(d))' "$1"
+  if [[ "$ARM" == "walv6" ]]; then
+    python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d["writeMode"]="walEmit"; print(json.dumps(d))' "$1"
+    return 0
+  fi
+  echo "$1"
 }
 
 scenario_enabled() { # short-name без суффикса (s1, s3...)
@@ -466,6 +471,8 @@ if pg_before and pg_after:
             s["role"] = "polling-peek"
         elif "advance_outbox_slot" in ql or "pg_replication_slot_advance" in ql:
             s["role"] = "polling-advance"
+        elif "emit_outbox_frame" in ql or "pg_logical_emit_message" in ql:
+            s["role"] = "writer-wal-emit"
         elif "outbox_slot_status" in ql:
             s["role"] = "slot-status"
         else:
@@ -774,9 +781,15 @@ if t0s and t2s:
         "writer": cycle_role_resources([f"{proj}-writer-"], min(t0s), max(t2s)),
     }
 
+cycle_labels = {
+    "polling": "A (polling)",
+    "streaming": "B (streaming)",
+    "competing": "C (competing)",
+    "walv6": "D (walv6)",
+}
 report = {
     "schema": "streaming-polling-outbox/benchmark/v1",
-    "cycle": "A (polling)" if arm == "polling" else "B (streaming)",
+    "cycle": cycle_labels.get(arm, arm),
     "arm": arm,
     "startedAt": os.environ["CYCLE_STAMP"],
     "git": git,
@@ -820,10 +833,11 @@ PY
 run_cycle() { # arm
   ARM=$1
   case "$ARM" in
-    polling)   CDC_PORT=$PPORT; ARM_LABEL="A" ;;
-    streaming) CDC_PORT=$SPORT; ARM_LABEL="B" ;;
-    competing) CDC_PORT=$CPORT; ARM_LABEL="C" ;;
-    *)         CDC_PORT=$SPORT; ARM_LABEL="?" ;;
+    polling)   CDC_PORT=$PPORT;   ARM_LABEL="A" ;;
+    streaming) CDC_PORT=$SPORT;   ARM_LABEL="B" ;;
+    competing) CDC_PORT=$CPORT;   ARM_LABEL="C" ;;
+    walv6)     CDC_PORT=$WV6PORT; ARM_LABEL="D" ;;
+    *)         CDC_PORT=$SPORT;   ARM_LABEL="?" ;;
   esac
   CYCLE_STAMP=$(date +%Y-%m-%dT%H:%M:%S)
   CYCLE_DIR="results/raw/$(date +%Y%m%d-%H%M%S)-benchmark-$ARM"
@@ -961,6 +975,10 @@ fi
 if [[ "$CYCLE_ARG" == "all" || "$CYCLE_ARG" == "competing" ]]; then
   [[ "$CYCLE_ARG" == "all" ]] && SKIP_WIPE=0   # полный путь цикла C: чистая инфраструктура
   run_cycle competing
+fi
+if [[ "$CYCLE_ARG" == "all" || "$CYCLE_ARG" == "walv6" ]]; then
+  [[ "$CYCLE_ARG" == "all" ]] && SKIP_WIPE=0
+  run_cycle walv6
 fi
 
 [[ "$CYCLE_ARG" == "all" ]] && { section "Сводка всех arm"; arms_summary; }

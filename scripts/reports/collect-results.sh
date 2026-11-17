@@ -26,8 +26,9 @@ WBASE="http://localhost:${WRITER_HTTP_PORT:-18080}"
 PPOLL="http://localhost:${CDC_POLLING_HTTP_PORT:-18081}"
 PSTREAM="http://localhost:${CDC_STREAMING_HTTP_PORT:-18082}"
 PCOMP="http://localhost:${CDC_COMPETING_HTTP_PORT:-18084}"
+PWALV6="http://localhost:${CDC_WALV6_HTTP_PORT:-18086}"
 
-RUN_ID=${1:?usage: collect-results.sh RUN_ID [--arm auto|polling|streaming|competing] [--notes "..."] [--out DIR]}
+RUN_ID=${1:?usage: collect-results.sh RUN_ID [--arm auto|polling|streaming|competing|walv6] [--notes "..."] [--out DIR]}
 ARM=auto
 NOTES=""
 OUT_BASE="results/raw"
@@ -62,22 +63,25 @@ if [[ "$ARM" == "auto" ]]; then
   poll_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 "$PPOLL/api/cdc/state" || true)
   stream_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 "$PSTREAM/api/cdc/state" || true)
   comp_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 "$PCOMP/api/cdc/state" || true)
-  if [[ "$poll_code" == "200" && "$stream_code" == "200" ]] \
-     || [[ "$poll_code" == "200" && "$comp_code" == "200" ]] \
-     || [[ "$stream_code" == "200" && "$comp_code" == "200" ]]; then
-    echo "ERROR: отвечают НЕСКОЛЬКО CDC-сервисов — профили polling/streaming/competing взаимоисключающие. Укажите --arm." >&2
+  walv6_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 "$PWALV6/api/cdc/state" || true)
+  up_cnt=0
+  for c in "$poll_code" "$stream_code" "$comp_code" "$walv6_code"; do [[ "$c" == "200" ]] && up_cnt=$((up_cnt+1)); done
+  if [[ "$up_cnt" -gt 1 ]]; then
+    echo "ERROR: отвечают НЕСКОЛЬКО CDC-сервисов — профили взаимоисключающие. Укажите --arm." >&2
     exit 2
   elif [[ "$poll_code" == "200" ]]; then ARM=polling
   elif [[ "$stream_code" == "200" ]]; then ARM=streaming
   elif [[ "$comp_code" == "200" ]]; then ARM=competing
+  elif [[ "$walv6_code" == "200" ]]; then ARM=walv6
   else
-    echo "ERROR: ни один CDC не отвечает ($PPOLL / $PSTREAM / $PCOMP). Запустите профиль и повторите." >&2
+    echo "ERROR: ни один CDC не отвечает ($PPOLL / $PSTREAM / $PCOMP / $PWALV6). Запустите профиль и повторите." >&2
     exit 2
   fi
 fi
 CBASE="$PPOLL"
 [[ "$ARM" == "streaming" ]] && CBASE="$PSTREAM"
 [[ "$ARM" == "competing" ]] && CBASE="$PCOMP"
+[[ "$ARM" == "walv6" ]] && CBASE="$PWALV6"
 curl -s --max-time 8 "$CBASE/api/cdc/state" -o /tmp/cr-cdc-state.json
 python3 -c "import json; json.load(open('/tmp/cr-cdc-state.json'))" 2>/dev/null || { echo "ERROR: /api/cdc/state недоступен ($CBASE)" >&2; exit 2; }
 echo "== arm: $ARM ($CBASE)"
@@ -285,8 +289,8 @@ series = [  # (колонка CSV, PromQL)
     # wal_lag/confirmed_lsn у competing пустые (arm без слота) — колонки остаются,
     # чтобы схема timeseries.csv была одинаковой для всех arm.
 ]
-if arm == "streaming":
-    series.append(("cdc_channel_depth", 'cdc_streaming_channel_depth'))
+if arm in ("streaming", "walv6"):
+    series.append(("cdc_channel_depth", f'cdc_{arm}_channel_depth'))
 if arm == "competing":
     series.append(("cdc_active_workers", 'cdc_competing_active_workers'))
 

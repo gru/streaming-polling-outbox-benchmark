@@ -28,6 +28,7 @@ public sealed class CdcClient
                      ("polling", _options.CdcPolling.BaseUrl),
                      ("streaming", _options.CdcStreaming.BaseUrl),
                      ("competing", _options.CdcCompeting.BaseUrl),
+                     ("walv6", _options.CdcWalV6.BaseUrl),
                  })
         {
             if (string.IsNullOrWhiteSpace(baseUrl))

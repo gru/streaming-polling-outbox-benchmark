@@ -17,7 +17,7 @@ BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 BENCH_DIR = os.path.join(BASE, "results", "benchmark")
 
 NAME_RE = re.compile(
-    r"benchmark-(?P<arm>polling|streaming|competing)"
+    r"benchmark-(?P<arm>polling|streaming|competing|walv6)"
     r"-b(?P<batch>\d+)(?:-w(?P<workers>\d+))?(?P<failed>-failed)?\.json$"
 )
 
@@ -60,8 +60,8 @@ def load_config_files():
             "failed": bool(m.group("failed")),
             "data": data,
         })
-    # сортировка: arm (polling, streaming, competing) → batch → workers
-    order = {"polling": 0, "streaming": 1, "competing": 2}
+    # сортировка: arm → batch → workers
+    order = {"polling": 0, "streaming": 1, "competing": 2, "walv6": 3}
     out.sort(key=lambda c: (order.get(c["arm"], 9), c["batch"], c["workers"] or 0))
     return out
 

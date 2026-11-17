@@ -45,6 +45,10 @@ scrape_configs:
     static_configs:
       - targets: ['cdc-competing:8080']
 
+  - job_name: cdc-walv6
+    static_configs:
+      - targets: ['cdc-walv6:8080']
+
   # Валидатор доставки: потребление topic, валидации прогонов, состояние.
   # Детализация по прогонам — через HTTP API валидатора, не через метрики.
   - job_name: kafka-validator

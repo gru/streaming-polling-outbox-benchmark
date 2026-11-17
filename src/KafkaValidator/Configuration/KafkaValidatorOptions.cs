@@ -29,6 +29,9 @@ public sealed class KafkaValidatorOptions
 
     /// <summary>CDC Competing HTTP API (обогащение вердикта, profile competing).</summary>
     public EndpointOptions CdcCompeting { get; set; } = new() { BaseUrl = "http://cdc-competing:8080" };
+
+    /// <summary>CDC WalV6 HTTP API (обогащение вердикта, profile walv6).</summary>
+    public EndpointOptions CdcWalV6 { get; set; } = new() { BaseUrl = "http://cdc-walv6:8080" };
 }
 
 public sealed class KafkaOptions
