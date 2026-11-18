@@ -233,10 +233,21 @@ public sealed class GenerationEngine : IHostedService
                     break;
                 }
 
-                var (messages, bytes) = MessageFactory.CreateBatch(p.RunId, size, p.MessageSizeBytes);
-                Interlocked.Add(ref ctx.Dispatched, size);
-                Interlocked.Add(ref ctx.DispatchedBytes, bytes);
-                var task = Task.Run(() => ExecuteBatchAsync(ctx, messages, bytes));
+                Task task;
+                if (p.WriteMode == WriteModes.WalEmit)
+                {
+                    var packed = WalSuperFrameMessageFactory.CreatePackedBatch(p.RunId, size, p.MessageSizeBytes);
+                    Interlocked.Add(ref ctx.Dispatched, size);
+                    Interlocked.Add(ref ctx.DispatchedBytes, packed.TotalBodyBytes);
+                    task = Task.Run(() => ExecuteWalEmitBatchAsync(ctx, packed));
+                }
+                else
+                {
+                    var (messages, bytes) = MessageFactory.CreateBatch(p.RunId, size, p.MessageSizeBytes);
+                    Interlocked.Add(ref ctx.Dispatched, size);
+                    Interlocked.Add(ref ctx.DispatchedBytes, bytes);
+                    task = Task.Run(() => ExecuteBatchAsync(ctx, messages, bytes));
+                }
                 lock (ctx.Sync) ctx.Tasks.Add(task);
 
                 if (timer is not null)
@@ -253,6 +264,32 @@ public sealed class GenerationEngine : IHostedService
         }
     }
 
+    private async Task ExecuteWalEmitBatchAsync(RunContext ctx, PackedBatch packed)
+    {
+        try
+        {
+            var res = await _db.WritePackedFrameAsync(packed.WalFrameBytes, ctx.HardCts.Token, ctx.StopCts.Token);
+            RecordBatchOutcome(ctx, res, packed.Ids, packed.TotalBodyBytes);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Прогон {RunId}: необработанное исключение в ExecuteWalEmitBatchAsync", ctx.Profile.RunId);
+            lock (ctx.Sync)
+            {
+                ctx.Fatal = true;
+                ctx.FatalError ??= $"engine(walEmit): {ex.Message}";
+                ctx.Failed += packed.Ids.Length;
+                ctx.FailedIds.AddRange(packed.Ids);
+                ctx.ErrorMessages.Add($"{DateTimeOffset.UtcNow:O} FATAL(engine): {Trunc(ex.Message)}");
+            }
+            _metrics.WriteErrors.Add(1, new KeyValuePair<string, object?>("reason", "fatal"));
+        }
+        finally
+        {
+            ctx.Sem.Release();
+        }
+    }
+
     private async Task ExecuteBatchAsync(RunContext ctx, OutboxMessage[] messages, long bodyBytes)
     {
         try
@@ -260,70 +297,7 @@ public sealed class GenerationEngine : IHostedService
             var res = await _db.WriteBatchAsync(
                 ctx.Profile.WriteMode == WriteModes.InsertOnly, messages, ctx.HardCts.Token, ctx.StopCts.Token);
             var ids = messages.Select(m => m.Id).ToArray();
-            var reconnects = Math.Max(0, res.Attempts - 1);
-
-            lock (ctx.Sync)
-            {
-                ctx.Batches++;
-                ctx.Reconnects += reconnects;
-                switch (res.Outcome)
-                {
-                    case BatchOutcome.Committed:
-                    case BatchOutcome.AlreadyCommitted:
-                        ctx.Written += messages.Length;
-                        ctx.Bytes += bodyBytes;
-                        ctx.Commits++;
-                        // у AlreadyCommitted реальная длительность commit прошлой попытки неизвестна —
-                        // в выборку commit-латентности не попадает, только в batch-длительность
-                        if (res.Outcome == BatchOutcome.Committed) ctx.CommitMs.Add(res.CommitDurationMs);
-                        ctx.BatchMs.Add(res.BatchDurationMs);
-                        ctx.WrittenIds.AddRange(ids);
-                        if (res.Outcome == BatchOutcome.AlreadyCommitted) ctx.AlreadyCommitted += messages.Length;
-                        if (res.LastTransientError is not null)
-                            ctx.ErrorMessages.Add($"{DateTimeOffset.UtcNow:O} transient→resolved: {Trunc(res.LastTransientError)}");
-                        break;
-
-                    case BatchOutcome.Cancelled:
-                        ctx.Ambiguous += messages.Length;
-                        ctx.AmbiguousIds.AddRange(ids);
-                        ctx.ErrorMessages.Add($"{DateTimeOffset.UtcNow:O} AMBIGUOUS (остановка в retry): {Trunc(res.LastTransientError ?? "")}");
-                        break;
-
-                    case BatchOutcome.Fatal:
-                        ctx.Failed += messages.Length;
-                        ctx.FailedIds.AddRange(ids);
-                        ctx.Fatal = true;
-                        ctx.FatalError ??= res.FatalError ?? "unknown fatal";
-                        ctx.ErrorMessages.Add($"{DateTimeOffset.UtcNow:O} FATAL: {Trunc(res.FatalError ?? "unknown")}");
-                        break;
-                }
-                if (ctx.ErrorMessages.Count > 20) ctx.ErrorMessages.RemoveRange(0, ctx.ErrorMessages.Count - 20);
-            }
-
-            // метрики — вне lock
-            _metrics.Reconnects.Add(reconnects);
-            switch (res.Outcome)
-            {
-                case BatchOutcome.Committed:
-                case BatchOutcome.AlreadyCommitted:
-                    _metrics.MessagesWritten.Add(messages.Length);
-                    _metrics.BytesWritten.Add(bodyBytes);
-                    _metrics.BatchDurationMs.Record(res.BatchDurationMs);
-                    if (res.Outcome == BatchOutcome.Committed)
-                        _metrics.CommitDurationMs.Record(res.CommitDurationMs);
-                    break;
-                case BatchOutcome.Cancelled:
-                    _metrics.AmbiguousCommits.Add(1);
-                    _metrics.WriteErrors.Add(1, new KeyValuePair<string, object?>("reason", "ambiguous"));
-                    break;
-                case BatchOutcome.Fatal:
-                    _metrics.WriteErrors.Add(1, new KeyValuePair<string, object?>("reason", "fatal"));
-                    break;
-            }
-
-            if (res.Outcome == BatchOutcome.Fatal)
-                _logger.LogError("Прогон {RunId}: фатальная ошибка записи батча ({Count} сообщений): {Error}",
-                    ctx.Profile.RunId, messages.Length, res.FatalError);
+            RecordBatchOutcome(ctx, res, ids, bodyBytes);
         }
         catch (Exception ex)
         {
@@ -343,6 +317,73 @@ public sealed class GenerationEngine : IHostedService
         {
             ctx.Sem.Release();
         }
+    }
+
+    private void RecordBatchOutcome(RunContext ctx, BatchResult res, Guid[] ids, long bodyBytes)
+    {
+        var reconnects = Math.Max(0, res.Attempts - 1);
+        lock (ctx.Sync)
+        {
+            ctx.Batches++;
+            ctx.Reconnects += reconnects;
+            switch (res.Outcome)
+            {
+                case BatchOutcome.Committed:
+                case BatchOutcome.AlreadyCommitted:
+                    ctx.Written += ids.Length;
+                    ctx.Bytes += bodyBytes;
+                    ctx.Commits++;
+                    // у AlreadyCommitted реальная длительность commit прошлой попытки неизвестна —
+                    // в выборку commit-латентности не попадает, только в batch-длительность
+                    if (res.Outcome == BatchOutcome.Committed) ctx.CommitMs.Add(res.CommitDurationMs);
+                    ctx.BatchMs.Add(res.BatchDurationMs);
+                    ctx.WrittenIds.AddRange(ids);
+                    if (res.Outcome == BatchOutcome.AlreadyCommitted) ctx.AlreadyCommitted += ids.Length;
+                    if (res.LastTransientError is not null)
+                        ctx.ErrorMessages.Add($"{DateTimeOffset.UtcNow:O} transient→resolved: {Trunc(res.LastTransientError)}");
+                    break;
+
+                case BatchOutcome.Cancelled:
+                    ctx.Ambiguous += ids.Length;
+                    ctx.AmbiguousIds.AddRange(ids);
+                    ctx.ErrorMessages.Add($"{DateTimeOffset.UtcNow:O} AMBIGUOUS (остановка в retry): {Trunc(res.LastTransientError ?? "")}");
+                    break;
+
+                case BatchOutcome.Fatal:
+                    ctx.Failed += ids.Length;
+                    ctx.FailedIds.AddRange(ids);
+                    ctx.Fatal = true;
+                    ctx.FatalError ??= res.FatalError ?? "unknown fatal";
+                    ctx.ErrorMessages.Add($"{DateTimeOffset.UtcNow:O} FATAL: {Trunc(res.FatalError ?? "unknown")}");
+                    break;
+            }
+            if (ctx.ErrorMessages.Count > 20) ctx.ErrorMessages.RemoveRange(0, ctx.ErrorMessages.Count - 20);
+        }
+
+        // метрики — вне lock
+        _metrics.Reconnects.Add(reconnects);
+        switch (res.Outcome)
+        {
+            case BatchOutcome.Committed:
+            case BatchOutcome.AlreadyCommitted:
+                _metrics.MessagesWritten.Add(ids.Length);
+                _metrics.BytesWritten.Add(bodyBytes);
+                _metrics.BatchDurationMs.Record(res.BatchDurationMs);
+                if (res.Outcome == BatchOutcome.Committed)
+                    _metrics.CommitDurationMs.Record(res.CommitDurationMs);
+                break;
+            case BatchOutcome.Cancelled:
+                _metrics.AmbiguousCommits.Add(1);
+                _metrics.WriteErrors.Add(1, new KeyValuePair<string, object?>("reason", "ambiguous"));
+                break;
+            case BatchOutcome.Fatal:
+                _metrics.WriteErrors.Add(1, new KeyValuePair<string, object?>("reason", "fatal"));
+                break;
+        }
+
+        if (res.Outcome == BatchOutcome.Fatal)
+            _logger.LogError("Прогон {RunId}: фатальная ошибка записи батча ({Count} сообщений): {Error}",
+                ctx.Profile.RunId, ids.Length, res.FatalError);
     }
 
     private void FinalizeRun(RunContext ctx)

@@ -60,6 +60,8 @@ public sealed record LoadProfile
             ? WriteModes.InsertOnly
             : string.Equals(rawWriteMode, WriteModes.InsertDelete, StringComparison.OrdinalIgnoreCase)
             ? WriteModes.InsertDelete
+            : string.Equals(rawWriteMode, WriteModes.WalEmit, StringComparison.OrdinalIgnoreCase)
+            ? WriteModes.WalEmit
             : rawWriteMode; // нестандартное значение — попадёт в ошибку валидации ниже как есть
         var profile = new LoadProfile
         {
@@ -75,8 +77,8 @@ public sealed record LoadProfile
             RunUntilStopped = r?.RunUntilStopped ?? d.RunUntilStopped,
         };
 
-        if (profile.WriteMode is not (WriteModes.InsertDelete or WriteModes.InsertOnly))
-            errors.Add($"writeMode должен быть '{WriteModes.InsertDelete}' или '{WriteModes.InsertOnly}', получено '{profile.WriteMode}'");
+        if (profile.WriteMode is not (WriteModes.InsertDelete or WriteModes.InsertOnly or WriteModes.WalEmit))
+            errors.Add($"writeMode должен быть '{WriteModes.InsertDelete}', '{WriteModes.InsertOnly}' или '{WriteModes.WalEmit}', получено '{profile.WriteMode}'");
         if (profile.MessageSizeBytes is < 1 or > 10_000_000)
             errors.Add($"messageSizeBytes должен быть в [1..10000000], получено {profile.MessageSizeBytes}");
         if (profile.Parallelism is < 1 or > 64)

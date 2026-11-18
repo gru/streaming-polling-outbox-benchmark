@@ -89,11 +89,20 @@ bootstrap:
       # member-local postgresql.parameters для них игнорируются.
       parameters:
         password_encryption: scram-sha-256
-        max_connections: 300
-        shared_buffers: 128MB
-        # requirements.md раздел 4.4: logical replication + failover slots PG17.
-        # wal_level=logical нужен и на standby: иначе slotsync worker падает с FATAL.
+        max_connections: 1000
+        shared_buffers: 512MB
+        # Базовый профиль реального продакшена (PostgreSQL 17 accounting_system):
         wal_level: logical
+        wal_compression: lz4
+        wal_buffers: 32MB
+        max_wal_size: 4GB
+        min_wal_size: 1GB
+        checkpoint_timeout: 15min
+        checkpoint_completion_target: 0.9
+        autovacuum_max_workers: 3
+        autovacuum_naptime: 15s
+        logical_decoding_work_mem: 256MB
+        synchronous_commit: on
         max_replication_slots: 10
         max_wal_senders: 10
         # Нативная синхронизация failover logical slots на standby (PG17).

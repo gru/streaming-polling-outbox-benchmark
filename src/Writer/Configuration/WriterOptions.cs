@@ -61,4 +61,5 @@ public static class WriteModes
 {
     public const string InsertDelete = "insertDelete";
     public const string InsertOnly = "insertOnly";
+    public const string WalEmit = "walEmit";
 }

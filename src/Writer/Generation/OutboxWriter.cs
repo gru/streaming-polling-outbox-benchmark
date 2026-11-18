@@ -166,6 +166,64 @@ public sealed class OutboxWriter : IAsyncDisposable
     }
 
     private const string DeleteSql = "DELETE FROM public.outbox_messages WHERE id = ANY($1)"; // holdRows=false
+    private const string EmitFrameSql = "SELECT public.emit_outbox_frame($1)";
+
+    /// <summary>
+    /// Безтабличная запись упакованного WAL SuperFrame одной бинарной записью в WAL
+    /// через pg_logical_emit_message(true, 'outbox.events', frame) (writeMode=walEmit).
+    /// </summary>
+    public async Task<BatchResult> WritePackedFrameAsync(byte[] walFrameBytes,
+        CancellationToken hardCt, CancellationToken stopCt)
+    {
+        var attempts = 0;
+        string? lastTransient = null;
+        var totalSw = System.Diagnostics.Stopwatch.StartNew();
+
+        while (true)
+        {
+            attempts++;
+            try
+            {
+                await using var conn = await _source.OpenConnectionAsync(hardCt);
+                await using var cmd = new NpgsqlCommand(EmitFrameSql, conn);
+                cmd.Parameters.Add(new NpgsqlParameter<byte[]>
+                {
+                    NpgsqlDbType = NpgsqlDbType.Bytea,
+                    TypedValue = walFrameBytes,
+                });
+
+                var commitSw = System.Diagnostics.Stopwatch.StartNew();
+                await cmd.ExecuteScalarAsync(hardCt);
+                return new BatchResult(BatchOutcome.Committed, attempts,
+                    totalSw.Elapsed.TotalMilliseconds, commitSw.Elapsed.TotalMilliseconds);
+            }
+            catch (OperationCanceledException) when (hardCt.IsCancellationRequested)
+            {
+                return new BatchResult(BatchOutcome.Cancelled, attempts,
+                    totalSw.Elapsed.TotalMilliseconds, 0, LastTransientError: lastTransient);
+            }
+            catch (Exception ex) when (IsTransient(ex))
+            {
+                lastTransient = ex.Message;
+                using var waitCts = CancellationTokenSource.CreateLinkedTokenSource(stopCt, hardCt);
+                try
+                {
+                    await Task.Delay(BackoffDelay(attempts), waitCts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    return new BatchResult(BatchOutcome.Cancelled, attempts,
+                        totalSw.Elapsed.TotalMilliseconds, 0, LastTransientError: lastTransient);
+                }
+            }
+            catch (Exception ex)
+            {
+                var detail = ex is PostgresException pg ? $"{pg.SqlState}: {pg.MessageText}" : ex.Message;
+                return new BatchResult(BatchOutcome.Fatal, attempts,
+                    totalSw.Elapsed.TotalMilliseconds, 0, FatalError: detail, LastTransientError: lastTransient);
+            }
+        }
+    }
 
     private static string BuildInsertSql(int rows)
     {

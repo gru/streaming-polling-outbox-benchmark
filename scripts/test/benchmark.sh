@@ -38,6 +38,7 @@ VBASE="http://localhost:${KAFKA_VALIDATOR_HTTP_PORT:-18083}"
 PPORT="${CDC_POLLING_HTTP_PORT:-18081}"
 SPORT="${CDC_STREAMING_HTTP_PORT:-18082}"
 CPORT="${CDC_COMPETING_HTTP_PORT:-18084}"
+WV6PORT="${CDC_WALV6_HTTP_PORT:-18086}"
 
 CYCLE_ARG="all"
 SKIP_WIPE=0
@@ -50,8 +51,8 @@ while [[ $# -gt 0 ]]; do
     *) echo "неизвестный аргумент: $1"; exit 1 ;;
   esac
 done
-[[ "$CYCLE_ARG" == all || "$CYCLE_ARG" == polling || "$CYCLE_ARG" == streaming || "$CYCLE_ARG" == competing ]] \
-  || { echo "--cycle должен быть all|polling|streaming|competing"; exit 1; }
+[[ "$CYCLE_ARG" == all || "$CYCLE_ARG" == polling || "$CYCLE_ARG" == streaming || "$CYCLE_ARG" == competing || "$CYCLE_ARG" == walv6 ]] \
+  || { echo "--cycle должен быть all|polling|streaming|competing|walv6"; exit 1; }
 
 ARM=""; CDC_PORT=""   # ha-common.sh требует их после source
 source scripts/test/ha-common.sh
@@ -61,35 +62,46 @@ PASS=0; FAIL=0
 # Постоянная нагрузка — минимум 5-10 минут (требование владельца, этап 9):
 # короткие прогоны не выходят на установившийся режим (GC/checkpoint/окна scrape).
 # Порядок фиксирован; warmup не входит в отчёт сценариев (JIT/пулы/прогрев валидатора).
+S1_TOTAL="${BENCH_S1_TOTAL:-30000}"
+S2_TOTAL="${BENCH_S2_TOTAL:-60000}"
+S3_TOTAL="${BENCH_S3_TOTAL:-20000}"
+S4_TOTAL="${BENCH_S4_TOTAL:-15000}"
+S4_SIZE="${BENCH_S4_SIZE:-4096}"
+S5_TOTAL="${BENCH_S5_TOTAL:-4000000}"
+
 SCEN_NAMES=(s1-steady-50 s2-steady-200 s3-burst s4-large-4k s5-throughput)
 SCEN_DESCS=(
-  "равномерная низкая нагрузка 30000@50/s (~10 мин)"
-  "равномерная высокая нагрузка 60000@200/s (5 мин)"
-  "backlog-drain: burst 20000 без rate-limit (короткий по смыслу: скорость выборки)"
-  "крупные сообщения 15000@50/s x4096B (5 мин)"
-  "max throughput, pre-seeded backlog 4000000 без rate-limit: Writer пишет при ОСТАНОВЛЕННОМ CDC (напрямую через HAProxy, ~110-150k msg/s — из измерения исключено), после завершения записи CDC стартует и дрейнит чисто; узкое место по построению — только CDC. Слот за время простоя не инвалидируется (max_slot_wal_keep_size=-1), WAL (~3ГБ) копится и выбирается после старта; drain считается с момента state=running (бут контейнера отдельно в cdcBootMs)"
+  "равномерная низкая нагрузка ${S1_TOTAL}@50/s"
+  "равномерная высокая нагрузка ${S2_TOTAL}@200/s"
+  "backlog-drain: burst ${S3_TOTAL} без rate-limit (короткий по смыслу: скорость выборки)"
+  "крупные сообщения ${S4_TOTAL}@50/s x${S4_SIZE}B"
+  "max throughput, pre-seeded backlog ${S5_TOTAL} без rate-limit: Writer пишет при ОСТАНОВЛЕННОМ CDC (напрямую через HAProxy, из измерения исключено), после завершения записи CDC стартует и дрейнит чисто; узкое место по построению — только CDC; drain считается с момента state=running (бут контейнера отдельно в cdcBootMs)"
 )
 SCEN_SPECS=(
-  '{"totalMessages":30000,"ratePerSecond":50,"messageSizeBytes":256,"batchSize":50,"parallelism":4}'
-  '{"totalMessages":60000,"ratePerSecond":200,"messageSizeBytes":256,"batchSize":50,"parallelism":4}'
-  '{"totalMessages":20000,"messageSizeBytes":256,"batchSize":100,"parallelism":8}'
-  '{"totalMessages":15000,"ratePerSecond":50,"messageSizeBytes":4096,"batchSize":50,"parallelism":4}'
-  '{"totalMessages":4000000,"messageSizeBytes":256,"batchSize":100,"parallelism":8}'
+  "{\"totalMessages\":${S1_TOTAL},\"ratePerSecond\":50,\"messageSizeBytes\":256,\"batchSize\":50,\"parallelism\":4}"
+  "{\"totalMessages\":${S2_TOTAL},\"ratePerSecond\":200,\"messageSizeBytes\":256,\"batchSize\":50,\"parallelism\":4}"
+  "{\"totalMessages\":${S3_TOTAL},\"messageSizeBytes\":256,\"batchSize\":100,\"parallelism\":8}"
+  "{\"totalMessages\":${S4_TOTAL},\"ratePerSecond\":50,\"messageSizeBytes\":${S4_SIZE},\"batchSize\":50,\"parallelism\":4}"
+  "{\"totalMessages\":${S5_TOTAL},\"messageSizeBytes\":256,\"batchSize\":100,\"parallelism\":8}"
 )
 WARMUP_SPEC='{"totalMessages":500,"ratePerSecond":100,"messageSizeBytes":256,"batchSize":50,"parallelism":4}'
 
 # Спека прогона для текущего arm. Параметры НАГРУЗКИ одинаковы для всех arm (§11);
 # arm competing дополнительно получает writeMode=insertOnly — переключатель пути
 # ДОСТАВКИ, а не нагрузки: Writer оставляет строки в outbox-таблице, их разбирает
-# cdc-competing (DELETE … SKIP LOCKED … RETURNING). Остальные arm идут с дефолтом
-# writeMode=insertDelete (таблица пустая, сообщение живёт в WAL) — поведение
-# существующих циклов не меняется.
+# cdc-competing (DELETE … SKIP LOCKED … RETURNING). arm walv6 получает writeMode=walEmit
+# (безтабличная пакетная запись в WAL через pg_logical_emit_message). Остальные arm
+# идут с дефолтом writeMode=insertDelete (таблица пустая, сообщение живёт в WAL).
 spec_for_arm() { # spec-json → spec-json для текущего ARM
-  if [[ "$ARM" != "competing" ]]; then
-    echo "$1"
+  if [[ "$ARM" == "competing" ]]; then
+    python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d["writeMode"]="insertOnly"; print(json.dumps(d))' "$1"
     return 0
   fi
-  python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d["writeMode"]="insertOnly"; print(json.dumps(d))' "$1"
+  if [[ "$ARM" == "walv6" ]]; then
+    python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d["writeMode"]="walEmit"; print(json.dumps(d))' "$1"
+    return 0
+  fi
+  echo "$1"
 }
 
 scenario_enabled() { # short-name без суффикса (s1, s3...)
@@ -466,6 +478,8 @@ if pg_before and pg_after:
             s["role"] = "polling-peek"
         elif "advance_outbox_slot" in ql or "pg_replication_slot_advance" in ql:
             s["role"] = "polling-advance"
+        elif "emit_outbox_frame" in ql or "pg_logical_emit_message" in ql:
+            s["role"] = "writer-wal-emit"
         elif "outbox_slot_status" in ql:
             s["role"] = "slot-status"
         else:
@@ -774,9 +788,15 @@ if t0s and t2s:
         "writer": cycle_role_resources([f"{proj}-writer-"], min(t0s), max(t2s)),
     }
 
+cycle_labels = {
+    "polling": "A (polling)",
+    "streaming": "B (streaming)",
+    "competing": "C (competing)",
+    "walv6": "D (walv6)",
+}
 report = {
     "schema": "streaming-polling-outbox/benchmark/v1",
-    "cycle": "A (polling)" if arm == "polling" else "B (streaming)",
+    "cycle": cycle_labels.get(arm, arm),
     "arm": arm,
     "startedAt": os.environ["CYCLE_STAMP"],
     "git": git,
@@ -820,10 +840,11 @@ PY
 run_cycle() { # arm
   ARM=$1
   case "$ARM" in
-    polling)   CDC_PORT=$PPORT; ARM_LABEL="A" ;;
-    streaming) CDC_PORT=$SPORT; ARM_LABEL="B" ;;
-    competing) CDC_PORT=$CPORT; ARM_LABEL="C" ;;
-    *)         CDC_PORT=$SPORT; ARM_LABEL="?" ;;
+    polling)   CDC_PORT=$PPORT;   ARM_LABEL="A" ;;
+    streaming) CDC_PORT=$SPORT;   ARM_LABEL="B" ;;
+    competing) CDC_PORT=$CPORT;   ARM_LABEL="C" ;;
+    walv6)     CDC_PORT=$WV6PORT; ARM_LABEL="D" ;;
+    *)         CDC_PORT=$SPORT;   ARM_LABEL="?" ;;
   esac
   CYCLE_STAMP=$(date +%Y-%m-%dT%H:%M:%S)
   CYCLE_DIR="results/raw/$(date +%Y%m%d-%H%M%S)-benchmark-$ARM"
@@ -878,14 +899,15 @@ run_cycle() { # arm
 # наличии минимум двух arm-файлов (как раньше — только после --cycle all).
 arms_summary() {
   python3 <<'PY'
-import glob, json, os
-files = sorted(glob.glob("results/benchmark/benchmark-*.json"))
-if len(files) < 2:
-    raise SystemExit
+import json, os
+known = ("polling", "competing", "streaming", "walv6")
 arms = {}
-for path in files:
-    arm = os.path.basename(path)[len("benchmark-"):-len(".json")]
-    arms[arm] = json.load(open(path))
+for arm in known:
+    path = f"results/benchmark/benchmark-{arm}.json"
+    if os.path.isfile(path):
+        arms[arm] = json.load(open(path))
+if len(arms) < 2:
+    raise SystemExit
 def pick(s, *path):
     v = s
     for k in path:
@@ -961,6 +983,10 @@ fi
 if [[ "$CYCLE_ARG" == "all" || "$CYCLE_ARG" == "competing" ]]; then
   [[ "$CYCLE_ARG" == "all" ]] && SKIP_WIPE=0   # полный путь цикла C: чистая инфраструктура
   run_cycle competing
+fi
+if [[ "$CYCLE_ARG" == "all" || "$CYCLE_ARG" == "walv6" ]]; then
+  [[ "$CYCLE_ARG" == "all" ]] && SKIP_WIPE=0
+  run_cycle walv6
 fi
 
 [[ "$CYCLE_ARG" == "all" ]] && { section "Сводка всех arm"; arms_summary; }

@@ -1,0 +1,164 @@
+name: Сравнительный бенчмарк Outbox CDC
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'infrastructure/**'
+      - 'scripts/**'
+      - 'docker-compose.yml'
+      - '.env'
+      - '.github/workflows/benchmark.yml'
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Профиль нагрузки: ci (ускоренные steady s1-s4 + полный s5=4M) или full (полные 5-10 мин steady + s5=4M)'
+        required: true
+        type: choice
+        options:
+          - ci
+          - full
+        default: ci
+      arms:
+        description: 'Варианты для прогона (all или список через запятую: polling,competing,streaming,walv6)'
+        required: true
+        type: string
+        default: all
+      only_scenarios:
+        description: 'Подмножество сценариев (пусто = все s1..s5, либо например s3,s5)'
+        required: false
+        type: string
+        default: ''
+      s5_total:
+        description: 'Переопределение числа сообщений в s5 (пусто = 4000000)'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: outbox-benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: Замер 4 реализаций (Patroni PG17 + Kafka + Validator)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Подготовка раннера (освобождение портов и диска)
+        run: |
+          sudo systemctl stop postgresql mysql || true
+          sudo rm -rf /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Клонирование репозитория
+        uses: actions/checkout@v4
+
+      - name: Установка .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Сборка решения и модульные тесты
+        run: dotnet test streaming-polling-outbox.sln -c Release
+
+      - name: Предварительная сборка всех Docker-образов стенда
+        run: |
+          docker compose \
+            --profile polling \
+            --profile streaming \
+            --profile competing \
+            --profile walv6 \
+            build
+
+      - name: Запуск стендового бенчмарка по всем вариантам
+        id: run_bench
+        run: |
+          set -euo pipefail
+          chmod +x scripts/test/*.sh scripts/reset/*.sh scripts/reports/*.sh
+
+          # Удаляем предсохранённые локальные снапшоты, чтобы сводка отражала только текущий CI-прогон
+          rm -f results/benchmark/benchmark-polling.json \
+                results/benchmark/benchmark-streaming.json \
+                results/benchmark/benchmark-competing.json \
+                results/benchmark/benchmark-walv6.json \
+                results/benchmark/summary.json \
+                results/benchmark/ci-comparison.md
+
+          PROFILE="${{ inputs.profile || 'ci' }}"
+          ARMS_INPUT="${{ inputs.arms || 'all' }}"
+          ONLY_SCEN="${{ inputs.only_scenarios || '' }}"
+          S5_OVERRIDE="${{ inputs.s5_total || '' }}"
+
+          if [[ "$PROFILE" == "ci" ]]; then
+            export BENCH_S1_TOTAL=1500
+            export BENCH_S2_TOTAL=6000
+            export BENCH_S3_TOTAL=20000
+            export BENCH_S4_TOTAL=1500
+            export BENCH_S4_SIZE=4096
+            export BENCH_S5_TOTAL=4000000
+            export COLLECT_KAFKA_TIMEOUT_MS=5000
+          fi
+          if [[ -n "$S5_OVERRIDE" ]]; then
+            export BENCH_S5_TOTAL="$S5_OVERRIDE"
+          fi
+
+          ONLY_ARGS=()
+          if [[ -n "$ONLY_SCEN" ]]; then
+            ONLY_ARGS=(--only "$ONLY_SCEN")
+          fi
+
+          if [[ "$ARMS_INPUT" == "all" ]]; then
+            echo "EXPECTED_ARMS=polling,competing,streaming,walv6" >> "$GITHUB_ENV"
+            ./scripts/test/benchmark.sh --cycle all ${ONLY_ARGS[@]+"${ONLY_ARGS[@]}"}
+          else
+            echo "EXPECTED_ARMS=$ARMS_INPUT" >> "$GITHUB_ENV"
+            IFS=',' read -ra ARM_LIST <<< "$ARMS_INPUT"
+            for arm in "${ARM_LIST[@]}"; do
+              arm="$(echo "$arm" | xargs)"
+              [[ -z "$arm" ]] && continue
+              ./scripts/test/benchmark.sh --cycle "$arm" ${ONLY_ARGS[@]+"${ONLY_ARGS[@]}"}
+            done
+          fi
+
+      - name: Публикация сводной таблицы в GitHub Step Summary
+        if: always()
+        run: |
+          python3 scripts/reports/render-ci-summary.py \
+            --out results/benchmark/ci-comparison.md \
+            | tee -a "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Проверка полноты прогона и нулевых потерь (verdict == pass)
+        run: |
+          python3 scripts/reports/render-ci-summary.py \
+            --expected-arms "${EXPECTED_ARMS:-polling,competing,streaming,walv6}" \
+            --require-pass >/dev/null
+
+      - name: Диагностика контейнеров при сбое
+        if: failure()
+        run: |
+          docker ps -a || true
+          docker compose --profile polling --profile streaming --profile competing --profile walv6 logs --tail=80 || true
+
+      - name: Остановка стенда
+        if: always()
+        run: ./scripts/reset/wipe.sh || true
+
+      - name: Сохранение артефактов прогона (JSON + CSV + логи)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: outbox-benchmark-results-${{ github.run_number }}
+          path: |
+            results/benchmark/benchmark-*.json
+            results/benchmark/summary.json
+            results/benchmark/ci-comparison.md
+            results/raw/*/benchmark-report.json
+            results/raw/*/docker-stats.csv
+            results/raw/*/compose-up.log
+            results/raw/*/scenarios/*.json
+            results/raw/*/cdc-samples/*.tsv
+          if-no-files-found: warn

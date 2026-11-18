@@ -16,6 +16,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\CdcCommon\CdcCommon.csproj" />
+    <ProjectReference Include="..\..\src\CdcWalV6\CdcWalV6.csproj" />
+    <ProjectReference Include="..\..\src\Writer\Writer.csproj" />
   </ItemGroup>
 
 </Project>

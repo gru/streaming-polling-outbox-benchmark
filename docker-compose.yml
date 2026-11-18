@@ -116,6 +116,7 @@ services:
       PATRONI_POSTGRESQL_AUTHENTICATION_REPLICATION_USERNAME: postgres
       PATRONI_POSTGRESQL_AUTHENTICATION_REPLICATION_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     networks: [outbox-net]
+    shm_size: 256m
     volumes:
       - pg1_data:/var/lib/postgresql/data
     ports:
@@ -142,6 +143,7 @@ services:
       PATRONI_RESTAPI_CONNECT_ADDRESS: pg2:8008
       PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg2:5432
     networks: [outbox-net]
+    shm_size: 256m
     volumes:
       - pg2_data:/var/lib/postgresql/data
     ports:
@@ -168,6 +170,7 @@ services:
       PATRONI_RESTAPI_CONNECT_ADDRESS: pg3:8008
       PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg3:5432
     networks: [outbox-net]
+    shm_size: 256m
     volumes:
       - pg3_data:/var/lib/postgresql/data
     ports:
@@ -233,7 +236,7 @@ services:
         until psql -h haproxy -U postgres -d postgres -tAc "SELECT pg_is_in_recovery()" 2>/dev/null | grep -q f; do
           sleep 2
         done
-        for f in /init/00-roles.sql /init/01-db-publication.sql /init/02-slot.sql /init/04-cdc-polling.sql /init/05-cdc-streaming.sql /init/06-monitoring.sql /init/07-cdc-competing.sql; do
+        for f in /init/00-roles.sql /init/01-db-publication.sql /init/02-slot.sql /init/04-cdc-polling.sql /init/05-cdc-streaming.sql /init/06-monitoring.sql /init/07-cdc-competing.sql /init/08-cdc-walv6.sql; do
           echo "[init-db] Applying $$f"
           psql -v ON_ERROR_STOP=1 -h haproxy -U postgres -d postgres \
             -v sys_writer_password="$$SYS_WRITER_PASSWORD" \
@@ -546,6 +549,45 @@ services:
       # topic создаётся до старта CDC (сам CDC topic не создаёт, requirements.md 3.2)
       kafka-init: {condition: service_completed_successfully}
 
+  # ---------- CDC WalV6 (безтабличный pg_logical_emit_message + SuperFrame) ----------
+
+  cdc-walv6:
+    profiles: ["walv6"]
+    build:
+      context: ./src
+      dockerfile: CdcWalV6/Dockerfile
+    image: streaming-polling-outbox/cdc-walv6:net8.0
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      CDCWALV6__CONNECTION__ENDPOINT__HOST: haproxy
+      CDCWALV6__CONNECTION__ENDPOINT__PORT: "5432"
+      CDCWALV6__CONNECTION__DATABASE__NAME: outbox
+      CDCWALV6__CONNECTION__DATABASE__USERNAME: sys_replication
+      CDCWALV6__CONNECTION__DATABASE__PASSWORD: ${SYS_REPLICATION_PASSWORD:?set in .env}
+      CDCWALV6__STREAMING__SLOTNAME: outbox_slot
+      CDCWALV6__STREAMING__PUBLICATION: outbox_publication
+      CDCWALV6__STREAMING__CHANNELCAPACITY: "2048"
+      CDCWALV6__KAFKA__BROKERS: kafka1:9092
+      CDCWALV6__KAFKA__TOPIC: outbox.events
+      CDCWALV6__KAFKA__BATCHSIZE: ${CDC_WALV6_KAFKA_BATCH_SIZE:-10000}
+      CDCWALV6__KAFKA__LINGERMS: ${CDC_KAFKA_LINGER_MS:-0}
+      CDCWALV6__KAFKA__MESSAGETIMEOUTMS: "15000"
+    networks: [outbox-net]
+    ports:
+      - "${CDC_WALV6_HTTP_PORT:-18086}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      haproxy: {condition: service_healthy}
+      kafka1: {condition: service_healthy}
+      kafka-init: {condition: service_completed_successfully}
+
   # ---------- KafkaValidator (этап 7, requirements.md 15) ----------
   # Живой индекс содержимого topic outbox.events: consumer-группа kafka-validator
   # с auto.offset.reset=earliest и БЕЗ сохранения оффсетов — каждый старт читает
@@ -568,6 +610,7 @@ services:
       KAFKAVALIDATOR__CDCPOLLING__BASEURL: http://cdc-polling:8080
       KAFKAVALIDATOR__CDCSTREAMING__BASEURL: http://cdc-streaming:8080
       KAFKAVALIDATOR__CDCCOMPETING__BASEURL: http://cdc-competing:8080
+      KAFKAVALIDATOR__CDCWALV6__BASEURL: http://cdc-walv6:8080
     networks: [outbox-net]
     ports:
       - "${KAFKA_VALIDATOR_HTTP_PORT:-18083}:8080"

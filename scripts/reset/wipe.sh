@@ -11,5 +11,5 @@ echo "==> Остановка и удаление контейнеров, сет�
 # polling/streaming/competing) переживают wipe: контейнер остаётся живым, держит
 # сеть проекта («Resource is still in use») и после нового up reconnect-ится
 # к НОВОМУ кластеру, занимая logical slot / дорезая outbox-таблицу (грабли этапа 9).
-docker compose --profile polling --profile streaming --profile competing down -v --remove-orphans --timeout 30
+docker compose --profile polling --profile streaming --profile competing --profile walv6 down -v --remove-orphans --timeout 30
 echo "==> Готово. Стенд полностью удалён. Для запуска с нуля: docker compose --profile <arm> up -d --build"
